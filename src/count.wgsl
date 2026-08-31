@@ -22,6 +22,7 @@ var<private> p_counts: array<u32, base>;
 fn count(
     @builtin(global_invocation_id) global_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(subgroup_invocation_id) subgroup_id: u32,
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(num_workgroups) num_workgroups: vec3<u32>,
 ) {
@@ -37,7 +38,10 @@ fn count(
     }
 
     for (var i = 0u; i < base; i++) {
-        atomicAdd(&wg_counts[i], p_counts[i]);
+        let subgroup_sum = subgroupAdd(p_counts[i]);
+        if (subgroup_id == 0) {
+            atomicAdd(&wg_counts[i], subgroup_sum);
+        }
     }
     workgroupBarrier();
 

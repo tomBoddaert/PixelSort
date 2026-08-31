@@ -37,7 +37,7 @@ fn partial_sum(@builtin(local_invocation_id) local_id: vec3<u32>) {
     workgroupBarrier();
 
     // TODO: reduce from workgroup_size to a min of that and #blocks?
-    for (var stride = 1u; stride < workgroup_size; stride += stride) {
+    for (var stride = 1u; stride < workgroup_size; stride <<= 1) {
         var value = 0u;
         if (local_id.x >= stride) {
             value = offsets[(local_id.x - stride) * immediates.block_size];

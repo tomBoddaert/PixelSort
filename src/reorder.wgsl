@@ -78,7 +78,7 @@ fn reorder(
 }
 
 fn partial_sum(local_id: vec3<u32>) {
-    for (var stride = 1u; stride < workgroup_size; stride += stride) {
+    for (var stride = 1u; stride < workgroup_size; stride <<= 1) {
         if (local_id.x >= stride) {
             var j = local_id.x - stride;
             for (var cmp = 0u; cmp < base; cmp++) {
