@@ -394,36 +394,6 @@ pub const BASE: u32 = 2_u32.pow(BIT_LEN);
 //     }
 // }
 
-// fn run() {
-//     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-//         label: Some("encoder"),
-//     });
-
-//     encoder.copy_buffer_to_buffer(&upload, 0, &sort.count.input, 0, upload.size());
-
-//     sort.add_steps(&mut encoder, test_values_len);
-
-//     encoder.copy_buffer_to_buffer(&sort.reorder.output, 0, &download, 0, download.size());
-//     encoder.map_buffer_on_submit(&download, wgpu::MapMode::Read, .., |_| {});
-
-//     let ix = queue.submit([encoder.finish()]);
-//     device
-//         .poll(wgpu::PollType::Wait {
-//             submission_index: Some(ix),
-//             timeout: None,
-//         })
-//         .unwrap();
-
-//     let download_mapped = download.get_mapped_range(..).unwrap();
-//     let downloaded = bytemuck::cast_slice::<u8, u32>(&download_mapped);
-//     println!("Input:\t{test_values:>2?}");
-//     println!("Output:\t{downloaded:>2?}");
-
-//     let mut correct = test_values;
-//     correct.sort_unstable();
-//     assert_eq!(downloaded, &correct);
-// }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkgroupInfo {
     pub workgroup_size: u32,
@@ -490,7 +460,7 @@ pub const IMMEDIATES_SIZE: u32 = const_max_u32_slice(&[
     const_size_of_u32::<render::Immediates>(),
 ]);
 
-const fn const_usize_to_u32(value: usize) -> u32 {
+pub const fn const_usize_to_u32(value: usize) -> u32 {
     if size_of::<u32>() >= size_of::<usize>() {
         return value as u32;
     }
@@ -499,7 +469,7 @@ const fn const_usize_to_u32(value: usize) -> u32 {
     }
     value as u32
 }
-const fn const_usize_to_u64(value: usize) -> u64 {
+pub const fn const_usize_to_u64(value: usize) -> u64 {
     if size_of::<u64>() >= size_of::<usize>() {
         return value as u64;
     }
@@ -508,10 +478,10 @@ const fn const_usize_to_u64(value: usize) -> u64 {
     }
     value as u64
 }
-const fn const_size_of_u32<T>() -> u32 {
+pub const fn const_size_of_u32<T>() -> u32 {
     const_usize_to_u32(size_of::<T>())
 }
-const fn const_max_u32_slice(s: &[u32]) -> u32 {
+pub const fn const_max_u32_slice(s: &[u32]) -> u32 {
     let mut max = 0;
     let mut i = 0;
 

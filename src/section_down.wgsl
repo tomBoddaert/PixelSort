@@ -42,7 +42,7 @@ fn section_down(
         if (local_id.x == 0 && workgroup_id.x != 0) {
             let workgroup_offset_y = num_workgroups.x * workgroup_id.y;
             let left_workgroup_local = left_workgroup[workgroup_offset_y + workgroup_id.x - 1];
-            neighbour_right = workgroup_right[left_workgroup_local];
+            neighbour_right = workgroup_right[workgroup_offset_y + left_workgroup_local];
         }
 
         if (block_base == 0u) {

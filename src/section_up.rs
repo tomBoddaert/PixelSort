@@ -25,15 +25,6 @@ impl SectionUp {
     ) -> Self {
         let module = device.create_shader_module(wgpu::include_wgsl!("section_up.wgsl"));
 
-        // let image_size = Vec2U32 {
-        //     x: image.width(),
-        //     y: image.height(),
-        // };
-        // let image = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        //     label: Some("SectionUp::image"),
-        //     contents: &image,
-        //     usage: wgpu::BufferUsages::STORAGE,
-        // });
         let image_layout = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
