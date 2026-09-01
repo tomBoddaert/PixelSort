@@ -1,13 +1,7 @@
-use crate::{U32_SIZE, Vec2U32, WorkgroupInfo, const_size_of_u32};
-
-// TODO: replace this with a wgsl module to copy buffers without COPY_SRC for testing
-#[cfg(not(test))]
-const TEST_COPY_SRC: wgpu::BufferUsages = wgpu::BufferUsages::empty();
-#[cfg(test)]
-const TEST_COPY_SRC: wgpu::BufferUsages = wgpu::BufferUsages::COPY_SRC;
+use crate::{TEST_COPY_SRC, U32_SIZE, Vec2U32, WorkgroupInfo, const_size_of_u32};
 
 pub struct SectionUp {
-    pub image_size: Vec2U32,
+    pub max_image_size: Vec2U32,
     pub image: wgpu::Buffer,
     pub left_workgroup: wgpu::Buffer,
     pub workgroup_right: wgpu::Buffer,
@@ -20,11 +14,19 @@ impl SectionUp {
     pub fn new(
         device: &wgpu::Device,
         workgroup_info: WorkgroupInfo,
-        image_size: Vec2U32,
-        image: &wgpu::Buffer,
+        max_image_size: Vec2U32,
     ) -> Self {
         let module = device.create_shader_module(wgpu::include_wgsl!("section_up.wgsl"));
 
+        let image = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("{SectionUp, SectionDown}::image"),
+            size: max_image_size
+                .product()
+                .checked_mul(U32_SIZE.get())
+                .unwrap(),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let image_layout = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -42,10 +44,13 @@ impl SectionUp {
 
         let left_workgroup = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("{SectionUp, SectionGlobal, SectionDown}::left_workgroup"),
-            size: u64::from(workgroup_info.max_workgroups)
-                .checked_mul(image_size.y.into())
-                .and_then(|workgroups| workgroups.checked_mul(U32_SIZE.get()))
-                .unwrap(),
+            size: Vec2U32 {
+                x: workgroup_info.max_workgroups,
+                y: max_image_size.y,
+            }
+            .product()
+            .checked_mul(U32_SIZE.get())
+            .unwrap(),
             usage: wgpu::BufferUsages::STORAGE | TEST_COPY_SRC,
             mapped_at_creation: false,
         });
@@ -114,7 +119,7 @@ impl SectionUp {
         });
 
         Self {
-            image_size,
+            max_image_size,
             image: image.clone(),
             left_workgroup,
             workgroup_right,
@@ -125,7 +130,20 @@ impl SectionUp {
     }
 
     #[must_use]
-    pub fn add_step(&self, encoder: &mut wgpu::CommandEncoder) -> u32 {
+    pub fn add_step(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        image_size: Vec2U32,
+        threshold: f32,
+        image: &wgpu::Buffer,
+    ) -> u32 {
+        let pixels = image_size.product();
+        // Intentionally allow wider images within pixel limit
+        assert!(pixels <= self.max_image_size.product());
+        assert!(image_size.y <= self.max_image_size.y);
+
+        encoder.copy_buffer_to_buffer(image, 0, &self.image, 0, pixels * U32_SIZE.get());
+
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("SectionUp compute_pass"),
             timestamp_writes: None,
@@ -133,13 +151,13 @@ impl SectionUp {
 
         compute_pass.set_pipeline(&self.pipeline);
         compute_pass.set_bind_group(0, &self.bind_group, &[]);
-        let block_size = self.image_size.x.div_ceil(
+        let block_size = image_size.x.div_ceil(
             self.workgroup_info
                 .max_workgroups
                 .checked_mul(self.workgroup_info.workgroup_size)
                 .unwrap(),
         );
-        let workgroups = self.image_size.x.div_ceil(
+        let workgroups = image_size.x.div_ceil(
             self.workgroup_info
                 .workgroup_size
                 .checked_mul(block_size)
@@ -148,13 +166,13 @@ impl SectionUp {
         compute_pass.set_immediates(
             0,
             bytemuck::bytes_of(&Immediates {
-                width: self.image_size.x,
+                width: image_size.x,
                 block_size,
-                threshold: 0.4,
+                threshold,
             }),
         );
 
-        compute_pass.dispatch_workgroups(workgroups, self.image_size.y, 1);
+        compute_pass.dispatch_workgroups(workgroups, image_size.y, 1);
 
         workgroups
     }
@@ -172,7 +190,7 @@ pub struct Immediates {
 mod test {
     use wgpu::util::DeviceExt;
 
-    use crate::{Vec2U32, WorkgroupInfo, section_down::SectionDown, section_up::SectionUp};
+    use crate::{Vec2U32, WorkgroupInfo, section_up::SectionUp};
 
     #[test]
     fn basic() {
@@ -183,18 +201,22 @@ mod test {
         };
 
         const BLACK: u32 = 0x00000000;
-        const WHITE: u32 = 0xffffff00;
+        const WHITE: u32 = 0x00ffffff;
         let image = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice::<u32, u8>(&[
+                WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE,
+                WHITE, WHITE, WHITE, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK,
+                BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, //
                 BLACK, WHITE, BLACK, BLACK, WHITE, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK,
                 BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE,
                 BLACK, WHITE, BLACK, WHITE, WHITE, WHITE,
             ]),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
         });
+        let image_size = Vec2U32 { x: 30, y: 2 };
 
-        let section_up = SectionUp::new(device, workgroup_info, Vec2U32 { x: 30, y: 1 }, &image);
+        let section_up = SectionUp::new(device, workgroup_info, image_size);
 
         let download = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -205,7 +227,10 @@ mod test {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        assert_eq!(section_up.add_step(&mut encoder), 4);
+        assert_eq!(
+            section_up.add_step(&mut encoder, image_size, 0.5, &image),
+            4
+        );
         encoder.copy_buffer_to_buffer(
             &section_up.left_workgroup,
             0,
@@ -236,9 +261,17 @@ mod test {
             result,
             &[
                 0,
+                1,
+                1,
+                2, //
+                0,
                 0,
                 2,
                 3, //
+                0,
+                15,
+                u32::MAX,
+                u32::MAX, //
                 5,
                 u32::MAX,
                 18,

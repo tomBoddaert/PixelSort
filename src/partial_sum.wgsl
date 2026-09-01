@@ -12,25 +12,25 @@ var<storage, read> counts: array<u32>;
 var<storage, read_write> offsets: array<u32>;
 
 @compute @workgroup_size(workgroup_size)
-fn partial_sum(@builtin(local_invocation_id) local_id: vec3<u32>) {
-    let block_base = local_id.x * immediates.block_size;
-    let block_top = block_base + immediates.block_size;
+fn partial_sum(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let y_offset = immediates.count_len * global_id.y;
+    let block_base = immediates.block_size * global_id.x;
+    let block_top = min(immediates.block_size + block_base, immediates.count_len);
+    let _active = block_base < immediates.count_len;
 
-    if (block_base < immediates.count_len) {
-        var block_partial = counts[block_base];
+    if (_active) {
+        var block_partial = counts[y_offset + block_base];
         for (
             var i = block_base + 1;
             i < min(block_top, immediates.count_len);
             i++
         ) {
-            offsets[i] = block_partial;
-            block_partial += counts[i];
+            offsets[y_offset + i] = block_partial;
+            block_partial += counts[y_offset + i];
         }
 
         if (block_top < immediates.count_len) {
-            offsets[block_top] = block_partial;
-        } else {
-            offsets[0] = 0;
+            offsets[y_offset + block_top] = block_partial;
         }
     }
 
@@ -39,13 +39,13 @@ fn partial_sum(@builtin(local_invocation_id) local_id: vec3<u32>) {
     // TODO: reduce from workgroup_size to a min of that and #blocks?
     for (var stride = 1u; stride < workgroup_size; stride <<= 1) {
         var value = 0u;
-        if (local_id.x >= stride) {
-            value = offsets[(local_id.x - stride) * immediates.block_size];
+        if (global_id.x >= stride) {
+            value = offsets[y_offset + (global_id.x - stride) * immediates.block_size];
         }
         workgroupBarrier();
 
-        if (local_id.x >= stride) {
-            offsets[local_id.x * immediates.block_size] += value;
+        if (global_id.x >= stride) {
+            offsets[y_offset + global_id.x * immediates.block_size] += value;
         }
         workgroupBarrier();
     }
@@ -54,12 +54,12 @@ fn partial_sum(@builtin(local_invocation_id) local_id: vec3<u32>) {
         return;
     }
 
-    let prefix = offsets[block_base];
+    let prefix = offsets[y_offset + block_base];
     for (
         var i = block_base + 1;
         i < min(block_top, immediates.count_len);
         i++
     ) {
-        offsets[i] += prefix;
+        offsets[y_offset + i] += prefix;
     }
 }

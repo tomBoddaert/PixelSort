@@ -1,5 +1,4 @@
 const FLAG: u32 = ~0u;
-
 override workgroup_size: u32;
 
 struct Immediates {

@@ -1,18 +1,19 @@
 use crate::{U32_SIZE, WorkgroupInfo, const_size_of_u32};
 
 pub struct SectionGlobal {
-    pub image_height: u32,
+    pub max_image_height: u32,
     pub left_workgroup: wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
     pub pipeline: wgpu::ComputePipeline,
-    pub workgroup_size: u32,
+    pub workgroup_info: WorkgroupInfo,
 }
+
 impl SectionGlobal {
     pub fn new(
         device: &wgpu::Device,
         workgroup_info: WorkgroupInfo,
         left_workgroup: &wgpu::Buffer,
-        image_height: u32,
+        max_image_height: u32,
     ) -> Self {
         let module = device.create_shader_module(wgpu::include_wgsl!("section_global.wgsl"));
 
@@ -60,15 +61,18 @@ impl SectionGlobal {
         });
 
         Self {
-            image_height,
+            max_image_height,
             left_workgroup: left_workgroup.clone(),
             bind_group,
             pipeline,
-            workgroup_size: workgroup_info.workgroup_size,
+            workgroup_info,
         }
     }
 
-    pub fn add_step(&self, encoder: &mut wgpu::CommandEncoder, workgroups: u32) {
+    pub fn add_step(&self, encoder: &mut wgpu::CommandEncoder, image_height: u32, workgroups: u32) {
+        assert!(image_height <= self.max_image_height);
+        assert!(workgroups <= self.workgroup_info.max_workgroups);
+
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("SectionGlobal compute_pass"),
             timestamp_writes: None,
@@ -80,11 +84,11 @@ impl SectionGlobal {
             0,
             bytemuck::bytes_of(&Immediates {
                 workgroups,
-                block_size: workgroups.div_ceil(self.workgroup_size),
+                block_size: workgroups.div_ceil(self.workgroup_info.workgroup_size),
             }),
         );
 
-        compute_pass.dispatch_workgroups(1, self.image_height, 1);
+        compute_pass.dispatch_workgroups(1, image_height, 1);
     }
 }
 
@@ -99,14 +103,14 @@ pub struct Immediates {
 mod test {
     use wgpu::util::DeviceExt;
 
-    use crate::{WorkgroupInfo, section_global::SectionGlobal};
+    use crate::{TEST_COPY_SRC, WorkgroupInfo, section_global::SectionGlobal};
 
     #[test]
     fn basic() {
         let crate::test::State { device, queue } = crate::test::get_state();
         let workgroup_info = WorkgroupInfo {
             workgroup_size: 4,
-            max_workgroups: 2,
+            max_workgroups: 16,
         };
 
         let left_workgroup = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -115,7 +119,7 @@ mod test {
                 0, 0, 2, 2, 3, 4, 5, 6, 7, 9, 10, 11, 11, 12, 14, 15, //
                 0, 1, 1, 2, 3, 5, 5, 6, 8, 9, 10, 11, 11, 12, 13, 14,
             ]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | TEST_COPY_SRC,
         });
         let download = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -128,7 +132,7 @@ mod test {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        section_global.add_step(&mut encoder, 16);
+        section_global.add_step(&mut encoder, 2, 16);
         encoder.copy_buffer_to_buffer(&left_workgroup, 0, &download, 0, left_workgroup.size());
         encoder.map_buffer_on_submit(&download, wgpu::MapMode::Read, .., |_| {});
         let ix = queue.submit([encoder.finish()]);

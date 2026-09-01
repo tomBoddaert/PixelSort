@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use pixel_sort::{
     U64_SIZE, Vec2U32, WorkgroupInfo, const_max_u32_slice, const_size_of_u32, section::Section,
+    sort::Sort,
 };
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -141,6 +142,7 @@ impl State {
         };
 
         let section = Section::new(&device, workgroup_info, image_size);
+        let sort = Sort::new(&device, workgroup_info, image_size, section.tagged_image());
 
         let tagged_image_layout = wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -154,10 +156,10 @@ impl State {
         };
         let tagged_image_entry = wgpu::BindGroupEntry {
             binding: tagged_image_layout.binding,
-            resource: section.tagged_image().as_entire_binding(),
+            resource: sort.tagged_image().as_entire_binding(),
         };
 
-        let render_module = device.create_shader_module(wgpu::include_wgsl!("regions.wgsl"));
+        let render_module = device.create_shader_module(wgpu::include_wgsl!("sort.wgsl"));
 
         let render_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -202,6 +204,7 @@ impl State {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         section.add_step(&mut encoder, image_size, THRESHOLD, &image);
+        sort.add_step(&mut encoder, image_size);
         let idx = queue.submit([encoder.finish()]);
         device
             .poll(wgpu::PollType::Wait {
@@ -333,7 +336,7 @@ impl State {
 
 #[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
-pub struct Immediates {
+struct Immediates {
     pub size: Vec2U32,
     pub image_size: Vec2U32,
 }

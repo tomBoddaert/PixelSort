@@ -1,10 +1,10 @@
 use crate::{
-    U32_SIZE, U64_SIZE, Vec2U32, WorkgroupInfo, const_size_of_u32, section_up::Immediates,
+    TEST_COPY_SRC, U32_SIZE, U64_SIZE, Vec2U32, WorkgroupInfo, const_size_of_u32, section_up,
 };
 
 pub struct SectionDown {
-    pub image_size: Vec2U32,
-    pub image: wgpu::Buffer,
+    pub max_image_size: Vec2U32,
+    pub image_buffer: wgpu::Buffer,
     pub tagged_image: wgpu::Buffer,
     pub left_workgroup: wgpu::Buffer,
     pub workgroup_right: wgpu::Buffer,
@@ -17,7 +17,7 @@ impl SectionDown {
     pub fn new(
         device: &wgpu::Device,
         workgroup_info: WorkgroupInfo,
-        image_size: Vec2U32,
+        max_image_size: Vec2U32,
         image: &wgpu::Buffer,
         left_workgroup: &wgpu::Buffer,
         workgroup_right: &wgpu::Buffer,
@@ -40,9 +40,12 @@ impl SectionDown {
         };
 
         let tagged_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("SectionDown::tagged_image"),
-            size: image.size().checked_mul(2).unwrap(), // TODO: replace this
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            label: Some("{SectionDown, Count, Reorder}::tagged_image"),
+            size: max_image_size
+                .product()
+                .checked_mul(U64_SIZE.get())
+                .unwrap(),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | TEST_COPY_SRC,
             mapped_at_creation: false,
         });
         let tagged_image_layout = wgpu::BindGroupLayoutEntry {
@@ -129,8 +132,8 @@ impl SectionDown {
         });
 
         Self {
-            image_size,
-            image: image.clone(),
+            max_image_size,
+            image_buffer: image.clone(),
             tagged_image,
             left_workgroup: left_workgroup.clone(),
             workgroup_right: workgroup_right.clone(),
@@ -140,7 +143,17 @@ impl SectionDown {
         }
     }
 
-    pub fn add_step(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn add_step(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        image_size: Vec2U32,
+        threshold: f32,
+    ) {
+        let pixels = image_size.product();
+        // Intentionally allow wider images within pixel limit
+        assert!(pixels <= self.max_image_size.product());
+        assert!(image_size.y <= self.max_image_size.y);
+
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("SectionDown compute_pass"),
             timestamp_writes: None,
@@ -148,13 +161,13 @@ impl SectionDown {
 
         compute_pass.set_pipeline(&self.pipeline);
         compute_pass.set_bind_group(0, &self.bind_group, &[]);
-        let block_size = self.image_size.x.div_ceil(
+        let block_size = image_size.x.div_ceil(
             self.workgroup_info
                 .max_workgroups
                 .checked_mul(self.workgroup_info.workgroup_size)
                 .unwrap(),
         );
-        let workgroups = self.image_size.x.div_ceil(
+        let workgroups = image_size.x.div_ceil(
             self.workgroup_info
                 .workgroup_size
                 .checked_mul(block_size)
@@ -163,15 +176,17 @@ impl SectionDown {
         compute_pass.set_immediates(
             0,
             bytemuck::bytes_of(&Immediates {
-                width: self.image_size.x,
+                width: image_size.x,
                 block_size,
-                threshold: 0.4,
+                threshold,
             }),
         );
 
-        compute_pass.dispatch_workgroups(workgroups, self.image_size.y, 1);
+        compute_pass.dispatch_workgroups(workgroups, image_size.y, 1);
     }
 }
+
+pub type Immediates = section_up::Immediates;
 
 #[cfg(test)]
 mod test {
@@ -188,31 +203,47 @@ mod test {
         };
 
         const BLACK: u32 = 0x00000000;
-        const WHITE: u32 = 0xffffff00;
+        const WHITE: u32 = 0x00ffffff;
         let image = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice::<u32, u8>(&[
+                WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE,
+                WHITE, WHITE, WHITE, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK,
+                BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, //
                 BLACK, WHITE, BLACK, BLACK, WHITE, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, BLACK,
                 BLACK, BLACK, BLACK, BLACK, BLACK, BLACK, WHITE, WHITE, WHITE, WHITE, WHITE, WHITE,
                 BLACK, WHITE, BLACK, WHITE, WHITE, WHITE,
             ]),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        let image_size = Vec2U32 { x: 30, y: 2 };
         let left_workgroup = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice::<u32, u8>(&[0, 0, 2, 3]),
+            contents: bytemuck::cast_slice::<u32, u8>(&[
+                0, 1, 1, 1, //
+                0, 0, 2, 3,
+            ]),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let workgroup_right = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice::<u32, u8>(&[5, u32::MAX, 18, 27]),
+            contents: bytemuck::cast_slice::<u32, u8>(&[
+                0,
+                15,
+                u32::MAX,
+                u32::MAX, //
+                5,
+                u32::MAX,
+                18,
+                27,
+            ]),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
         let section_down = SectionDown::new(
             device,
             workgroup_info,
-            Vec2U32 { x: 30, y: 1 },
+            image_size,
             &image,
             &left_workgroup,
             &workgroup_right,
@@ -227,7 +258,7 @@ mod test {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        section_down.add_step(&mut encoder);
+        section_down.add_step(&mut encoder, image_size, 0.5);
         encoder.copy_buffer_to_buffer(
             &section_down.tagged_image,
             0,
@@ -245,13 +276,25 @@ mod test {
             .unwrap();
 
         let downloaded = download.get_mapped_range(..).unwrap();
-        let result = bytemuck::cast_slice::<u8, Vec2U32>(&downloaded);
+        let result = bytemuck::cast_slice::<u8, u32>(&downloaded);
 
         assert_eq!(
-            &*result.iter().map(|v| v.x >> 16).collect::<Box<[_]>>(),
+            result,
             &[
-                0, 1, 2, 2, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 18, 18, 18, 18, 18, 18, 24,
-                25, 26, 27, 27, 27
+                0x000ff, WHITE, 0x000ff, WHITE, 0x000ff, WHITE, 0x000ff, WHITE, 0x000ff, WHITE,
+                0x000ff, WHITE, 0x000ff, WHITE, 0x000ff, WHITE, 0x000ff, WHITE, 0x000ff, WHITE,
+                0x000ff, WHITE, 0x000ff, WHITE, 0x000ff, WHITE, 0x000ff, WHITE, 0x000ff, WHITE,
+                0xf0000, BLACK, 0xf0000, BLACK, 0xf0000, BLACK, 0xf0000, BLACK, 0xf0000, BLACK,
+                0xf0000, BLACK, 0xf0000, BLACK, 0xf0000, BLACK, 0xf0000, BLACK, 0xf0000, BLACK,
+                0xf0000, BLACK, 0xf0000, BLACK, 0xf0000, BLACK, 0xf0000, BLACK, 0xf0000,
+                BLACK, //
+                0x00000, BLACK, 0x100ff, WHITE, 0x20000, BLACK, 0x20000, BLACK, 0x400ff, WHITE,
+                0x50000, BLACK, 0x50000, BLACK, 0x50000, BLACK, 0x50000, BLACK, 0x50000, BLACK,
+                0x50000, BLACK, 0x50000, BLACK, 0x50000, BLACK, 0x50000, BLACK, 0x50000, BLACK,
+                0x50000, BLACK, 0x50000, BLACK, 0x50000, BLACK, 0x1200ff, WHITE, 0x1200ff, WHITE,
+                0x1200ff, WHITE, 0x1200ff, WHITE, 0x1200ff, WHITE, 0x1200ff, WHITE, 0x180000,
+                BLACK, 0x1900ff, WHITE, 0x1a0000, BLACK, 0x1b00ff, WHITE, 0x1b00ff, WHITE,
+                0x1b00ff, WHITE,
             ],
         );
     }
