@@ -1,4 +1,4 @@
-use pixel_sort::{U64_SIZE, Vec2U32, WorkgroupInfo, section::Section, sort::Sort};
+use pixel_sort::{U32_SIZE, Vec2U32};
 
 mod framework;
 
@@ -16,7 +16,7 @@ impl framework::Example for PixelSort {
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        workgroup_info: WorkgroupInfo,
+        workgroup_size: u32,
         image: wgpu::Buffer,
         image_size: Vec2U32,
     ) -> (
@@ -25,30 +25,28 @@ impl framework::Example for PixelSort {
         wgpu::BindGroupLayout,
         wgpu::BindGroup,
     ) {
-        let section = Section::new(device, workgroup_info, image_size);
-        let sort = Sort::new(device, workgroup_info, image_size, section.tagged_image());
+        let ps = pixel_sort::PixelSort::new(device, workgroup_size, image_size.product());
 
-        let tagged_image_layout = wgpu::BindGroupLayoutEntry {
+        let image_layout = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: true },
                 has_dynamic_offset: false,
-                min_binding_size: Some(U64_SIZE),
+                min_binding_size: Some(U32_SIZE),
             },
             count: None,
         };
-        let tagged_image_entry = wgpu::BindGroupEntry {
-            binding: tagged_image_layout.binding,
-            resource: sort.tagged_image().as_entire_binding(),
+        let image_entry = wgpu::BindGroupEntry {
+            binding: image_layout.binding,
+            resource: ps.image.as_entire_binding(),
         };
 
         const THRESHOLD: f32 = 0.4;
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        section.add_step(&mut encoder, image_size, THRESHOLD, &image);
-        sort.add_step(&mut encoder, image_size);
+        ps.add_step(&mut encoder, image_size, THRESHOLD, &image);
         let idx = queue.submit([encoder.finish()]);
         device
             .poll(wgpu::PollType::Wait {
@@ -61,12 +59,12 @@ impl framework::Example for PixelSort {
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
-            entries: &[tagged_image_layout],
+            entries: &[image_layout],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &bind_group_layout,
-            entries: &[tagged_image_entry],
+            entries: &[image_entry],
         });
 
         (Self { image_size }, module, bind_group_layout, bind_group)

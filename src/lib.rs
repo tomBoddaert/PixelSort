@@ -1,14 +1,5 @@
 use std::num::NonZero;
 
-pub mod count;
-pub mod partial_sum;
-pub mod reorder;
-pub mod section;
-pub mod section_down;
-pub mod section_global;
-pub mod section_up;
-pub mod sort;
-
 pub const U32_SIZE: NonZero<u64> = NonZero::new(const_usize_to_u64(size_of::<u32>())).unwrap();
 pub const U64_SIZE: NonZero<u64> = NonZero::new(const_usize_to_u64(size_of::<u64>())).unwrap();
 pub const BIT_LEN: u32 = 4;
@@ -20,10 +11,138 @@ const TEST_COPY_SRC: wgpu::BufferUsages = wgpu::BufferUsages::empty();
 #[cfg(test)]
 const TEST_COPY_SRC: wgpu::BufferUsages = wgpu::BufferUsages::COPY_SRC;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WorkgroupInfo {
+pub struct PixelSort {
+    pub max_pixels: u64,
+    pub image: wgpu::Buffer,
+    pub tagged_image: wgpu::Buffer,
+    pub bind_group: wgpu::BindGroup,
+    pub pipeline: wgpu::ComputePipeline,
     pub workgroup_size: u32,
-    pub max_workgroups: u32,
+}
+
+impl PixelSort {
+    pub fn new(device: &wgpu::Device, workgroup_size: u32, max_pixels: u64) -> Self {
+        let module = device.create_shader_module(wgpu::include_wgsl!("pixel_sort.wgsl"));
+
+        let image = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("PixelSort::image"),
+            size: max_pixels.checked_mul(U32_SIZE.get()).unwrap(),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | TEST_COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let image_layout = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: Some(U32_SIZE),
+            },
+            count: None,
+        };
+        let image_entry = wgpu::BindGroupEntry {
+            binding: image_layout.binding,
+            resource: image.as_entire_binding(),
+        };
+
+        let tagged_image = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("PixelSort::tagged_image"),
+            size: max_pixels.checked_mul(U64_SIZE.get() * 2).unwrap(),
+            usage: wgpu::BufferUsages::STORAGE | TEST_COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let tagged_image_layout = wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: Some(U64_SIZE),
+            },
+            count: None,
+        };
+        let tagged_image_entry = wgpu::BindGroupEntry {
+            binding: tagged_image_layout.binding,
+            resource: tagged_image.as_entire_binding(),
+        };
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("PixelSort bind_group_layout"),
+            entries: &[image_layout, tagged_image_layout],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PixelSort::bind_group"),
+            layout: &bind_group_layout,
+            entries: &[image_entry, tagged_image_entry],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("PixelSort pipeline_layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: const { const_size_of_u32::<Immediates>() },
+        });
+        let compilation_constants = [("workgroup_size", workgroup_size.into())];
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("PixelSort::pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &compilation_constants,
+                ..wgpu::PipelineCompilationOptions::default()
+            },
+            cache: None,
+        });
+
+        Self {
+            max_pixels,
+            image,
+            tagged_image,
+            bind_group,
+            pipeline,
+            workgroup_size,
+        }
+    }
+
+    pub fn add_step(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        image_size: Vec2U32,
+        threshold: f32,
+        image: &wgpu::Buffer,
+    ) {
+        let pixels = image_size.product();
+        assert!(pixels <= self.max_pixels);
+
+        encoder.copy_buffer_to_buffer(image, 0, &self.image, 0, pixels * U32_SIZE.get());
+
+        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("PixelSort compute_pass"),
+            timestamp_writes: None,
+        });
+
+        compute_pass.set_pipeline(&self.pipeline);
+        compute_pass.set_bind_group(0, &self.bind_group, &[]);
+        let block_size = image_size.x.div_ceil(self.workgroup_size);
+        compute_pass.set_immediates(
+            0,
+            bytemuck::bytes_of(&Immediates {
+                width: image_size.x,
+                block_size,
+                threshold,
+            }),
+        );
+
+        compute_pass.dispatch_workgroups(1, image_size.y, 1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+pub struct Immediates {
+    pub width: u32,
+    pub block_size: u32,
+    pub threshold: f32,
 }
 
 #[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
@@ -40,12 +159,7 @@ impl Vec2U32 {
     }
 }
 
-pub const IMMEDIATES_SIZE: u32 = const_max_u32_slice(&[
-    const_size_of_u32::<section_up::Immediates>(),
-    const_size_of_u32::<section_global::Immediates>(),
-    const_size_of_u32::<count::Immediates>(),
-    const_size_of_u32::<partial_sum::Immediates>(),
-]);
+pub const IMMEDIATES_SIZE: u32 = const_size_of_u32::<Immediates>();
 
 pub const fn const_usize_to_u32(value: usize) -> u32 {
     if size_of::<u32>() >= size_of::<usize>() {
@@ -74,8 +188,23 @@ pub const fn const_u32_to_usize(value: u32) -> usize {
     }
     value as usize
 }
+pub const fn const_u64_to_usize(value: u64) -> usize {
+    if size_of::<usize>() >= size_of::<u64>() {
+        return value as usize;
+    }
+    if value > usize::MAX as u64 {
+        panic!();
+    }
+    value as usize
+}
 pub const fn const_size_of_u32<T>() -> u32 {
     const_usize_to_u32(size_of::<T>())
+}
+pub const fn const_size_of_u64<T>() -> u64 {
+    const_usize_to_u64(size_of::<T>())
+}
+pub const fn const_size_of_value_u64<T>(_: &T) -> u64 {
+    const_size_of_u64::<T>()
 }
 pub const fn const_max_u32_slice(s: &[u32]) -> u32 {
     let mut max = 0;
@@ -94,16 +223,22 @@ pub const fn const_max_u32_slice(s: &[u32]) -> u32 {
 
 #[cfg(test)]
 mod test {
-    use std::sync::OnceLock;
+    use std::{num::NonZero, sync::OnceLock};
 
-    use crate::IMMEDIATES_SIZE;
+    use wgpu::util::DeviceExt;
 
-    pub struct State {
+    use crate::{
+        BASE, IMMEDIATES_SIZE, Immediates, PixelSort, Vec2U32, const_size_of_u32,
+        const_size_of_u64, const_u32_to_usize, const_u64_to_usize,
+    };
+
+    struct State {
         pub device: wgpu::Device,
         pub queue: wgpu::Queue,
+        pub module: wgpu::ShaderModule,
     }
     static STATE: OnceLock<State> = OnceLock::new();
-    pub fn get_state() -> &'static State {
+    fn get_state() -> &'static State {
         STATE.get_or_init(|| {
             env_logger::init();
 
@@ -136,7 +271,770 @@ mod test {
                 }))
                 .expect("Failed to create device");
 
-            State { device, queue }
+            let module = device.create_shader_module(wgpu::include_wgsl!("pixel_sort.wgsl"));
+
+            State {
+                device,
+                queue,
+                module,
+            }
         })
+    }
+
+    const WORKGROUP_SIZE: u32 = 5;
+    const WORKGROUP_SIZE_USIZE: usize = const_u32_to_usize(WORKGROUP_SIZE);
+    const COMPILATION_CONSTANTS: [(&str, f64); 1] = [("workgroup_size", WORKGROUP_SIZE as f64)];
+
+    const IMAGE_SIZE: Vec2U32 = Vec2U32 { x: 18, y: 3 };
+    const IMAGE_WIDTH_USIZE: usize = const_u32_to_usize(IMAGE_SIZE.x);
+    const IMAGE_HEIGHT_USIZE: usize = const_u32_to_usize(IMAGE_SIZE.y);
+    const IMAGE_PIXELS: u64 = IMAGE_SIZE.x as u64 * IMAGE_SIZE.y as u64;
+    const IMAGE_PIXELS_USIZE: usize = const_u64_to_usize(IMAGE_PIXELS);
+    const IMAGE_VALUE: [[u8; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = [
+        [
+            0x26, 0x49, 0x17, 0x6a, /**/ 0x40, 0x2c, 0x0d, 0x20, /**/ 0x7e, 0x21, 0x4d,
+            0x68, /**/ 0x3b, 0x40, 0x39, 0x2d, /**/ 0x5b, 0x6a,
+        ],
+        [
+            0x3e, 0xad, 0x49, 0x70, /**/ 0x05, 0x24, 0x5e, 0x5d, /**/ 0x66, 0xdb, 0xd3,
+            0xdc, /**/ 0x0d, 0x39, 0x62, 0x14, /**/ 0xcd, 0x6f,
+        ],
+        [
+            0xa4, 0x75, 0xe4, 0x76, /**/ 0xbe, 0x4d, 0xd9, 0x5e, /**/ 0x95, 0x0b, 0xfd,
+            0x69, /**/ 0xec, 0x23, 0xe3, 0x1a, /**/ 0xc6, 0x38,
+        ],
+    ];
+    const IMAGE: [[u32; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = {
+        let mut image = [[0; _]; _];
+
+        let mut i = 0;
+        while i < IMAGE_PIXELS_USIZE {
+            let value = IMAGE_VALUE.as_flattened()[i] as u32;
+            image.as_flattened_mut()[i] = 0x010101 * value;
+
+            i += 1;
+        }
+
+        image
+    };
+    const THRESHOLD: f32 = 0.5;
+    const BLOCK_SIZE: u32 = IMAGE_SIZE.x.div_ceil(WORKGROUP_SIZE);
+    const THRESHOLDED: [[bool; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = [
+        [false; IMAGE_WIDTH_USIZE],
+        [
+            false, true, false, false, /**/ false, false, false, false, /**/ false, true,
+            true, true, /**/ false, false, false, false, /**/ true, false,
+        ],
+        [
+            true, false, true, false, /**/ true, false, true, false, /**/ true, false,
+            true, false, /**/ true, false, true, false, /**/ true, false,
+        ],
+    ];
+    const PREVIOUS_BLOCK_CHANGE_COUNT: [[u32; WORKGROUP_SIZE_USIZE]; IMAGE_HEIGHT_USIZE] =
+        [[0; 5], [0, 2, 0, 2, 1], [0, 4, 4, 4, 4]];
+    const PREVIOUS_BLOCK_TAG: [[u32; WORKGROUP_SIZE_USIZE]; IMAGE_HEIGHT_USIZE] =
+        [[0; 5], [0, 2, 2, 4, 5], [0, 4, 8, 12, 16]];
+    const IMAGE_TAG: [[u32; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = [
+        [0; IMAGE_WIDTH_USIZE],
+        [
+            0, 1, 2, 2, /**/ 2, 2, 2, 2, /**/ 2, 3, 3, 3, /**/ 4, 4, 4, 4,
+            /**/ 5, 6,
+        ],
+        [
+            0, 1, 2, 3, /**/ 4, 5, 6, 7, /**/ 8, 9, 10, 11, /**/ 12, 13, 14, 15,
+            /**/ 16, 17,
+        ],
+    ];
+    // [IMAGE_TAG.0 << 16 | IMAGE_VALUE.0, IMAGE.0], [0, 0], [IMAGE_TAG.1 << 16 | IMAGE_VALUE.1, IMAGE.1], [0, 0], ...
+    const TAGGED_IMAGE: [[[u32; 2]; 2 * IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = {
+        let mut tagged_image = [[[0; 2]; _]; _];
+
+        let mut i = 0;
+        while i < IMAGE_PIXELS_USIZE {
+            let rgb = IMAGE.as_flattened()[i];
+            let value = IMAGE_VALUE.as_flattened()[i] as u32;
+            let tag = IMAGE_TAG.as_flattened()[i];
+            tagged_image.as_flattened_mut()[2 * i] = [tag << 16 | value, rgb];
+
+            i += 1;
+        }
+
+        tagged_image
+    };
+    const TAG_P_COUNT: [[[u32; const_u32_to_usize(BASE)]; WORKGROUP_SIZE_USIZE];
+        IMAGE_HEIGHT_USIZE] = [
+        [
+            [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ],
+        [
+            [1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ],
+        [
+            [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1],
+            [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ],
+    ];
+    const TAG_COUNT_PARTIAL_SUM: [[[u32; const_u32_to_usize(BASE)]; WORKGROUP_SIZE_USIZE];
+        IMAGE_HEIGHT_USIZE] = [
+        [
+            [
+                0, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
+            ],
+            [
+                4, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
+            ],
+            [
+                8, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
+            ],
+            [
+                12, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
+            ],
+            [
+                16, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
+            ],
+        ],
+        [
+            [0, 1, 2, 9, 12, 16, 17, 18, 18, 18, 18, 18, 18, 18, 18, 18],
+            [1, 2, 4, 9, 12, 16, 17, 18, 18, 18, 18, 18, 18, 18, 18, 18],
+            [1, 2, 8, 9, 12, 16, 17, 18, 18, 18, 18, 18, 18, 18, 18, 18],
+            [1, 2, 9, 12, 12, 16, 17, 18, 18, 18, 18, 18, 18, 18, 18, 18],
+            [1, 2, 9, 12, 16, 16, 17, 18, 18, 18, 18, 18, 18, 18, 18, 18],
+        ],
+        [
+            [0, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+            [1, 3, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+            [1, 3, 5, 6, 7, 8, 9, 10, 10, 11, 12, 13, 14, 15, 16, 17],
+            [1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 14, 15, 16, 17],
+            [1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+        ],
+    ];
+    const VALUE_P_COUNT: [[[u32; const_u32_to_usize(BASE)]; WORKGROUP_SIZE_USIZE];
+        IMAGE_HEIGHT_USIZE] = [
+        [
+            //0 1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+            [0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0],
+            [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0],
+            [0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0],
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0],
+        ],
+        [
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0],
+            [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0],
+            [0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0],
+            [0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1],
+        ],
+        [
+            [0, 0, 0, 0, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 2, 0],
+            [0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0],
+            [0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        ],
+    ];
+    const VALUE_COUNT_PARTIAL_SUM: [[[u32; const_u32_to_usize(BASE)]; WORKGROUP_SIZE_USIZE];
+        IMAGE_HEIGHT_USIZE] = [
+        [
+            //0 1  2  3  4  5  6  7  8  9  a  b   c   d   e   f
+            [0, 3, 4, 4, 4, 4, 4, 5, 6, 7, 9, 11, 13, 14, 17, 18],
+            [0, 3, 4, 4, 4, 4, 5, 6, 6, 8, 10, 11, 13, 14, 17, 18],
+            [2, 3, 4, 4, 4, 4, 5, 6, 6, 8, 10, 11, 14, 15, 17, 18],
+            [2, 4, 4, 4, 4, 4, 5, 6, 7, 8, 10, 11, 14, 16, 18, 18],
+            [3, 4, 4, 4, 4, 4, 5, 6, 7, 9, 10, 12, 14, 17, 18, 18],
+        ],
+        [
+            //0 1  2  3  4  5  6  7  8  9  a  b  c   d   e   f
+            [0, 1, 1, 2, 3, 5, 6, 7, 7, 7, 9, 9, 10, 11, 15, 17],
+            [1, 1, 1, 2, 3, 5, 6, 7, 7, 8, 9, 9, 10, 12, 16, 17],
+            [1, 1, 1, 2, 4, 6, 6, 7, 7, 8, 9, 9, 10, 13, 17, 17],
+            [1, 1, 1, 3, 4, 6, 7, 7, 7, 8, 9, 10, 11, 13, 17, 17],
+            [1, 1, 2, 3, 5, 6, 7, 7, 7, 9, 9, 10, 11, 14, 17, 17],
+        ],
+        [
+            //0 1  2  3  4  5  6  7  8  9  a   b   c   d   e   f
+            [0, 0, 0, 0, 2, 4, 6, 8, 8, 9, 11, 12, 13, 14, 16, 18],
+            [0, 0, 0, 0, 4, 5, 7, 8, 8, 9, 11, 12, 13, 14, 16, 18],
+            [0, 0, 0, 0, 4, 5, 7, 8, 8, 10, 11, 12, 13, 15, 18, 18],
+            [0, 0, 0, 0, 4, 6, 7, 8, 8, 11, 11, 13, 13, 16, 18, 18],
+            [0, 0, 0, 2, 4, 6, 7, 8, 8, 11, 12, 13, 14, 16, 18, 18],
+        ],
+    ];
+    const IMAGE_REORDER: [[u32; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = [
+        [
+            4, 7, 5, 9, /**/ 0, 13, 14, 1, /**/ 17, 3, 15, 6, /**/ 11, 2, 8, 16,
+            /**/ 12, 10,
+        ],
+        [
+            15, 11, 7, 0, /**/ 5, 3, 16, 12, /**/ 6, 9, 2, 10, /**/ 13, 8, 1, 4,
+            /**/ 14, 17,
+        ],
+        [
+            2, 4, 3, 6, /**/ 16, 14, 9, 17, /**/ 5, 12, 15, 10, /**/ 13, 0, 1, 11,
+            /**/ 7, 8,
+        ],
+    ];
+    const TAGGED_IMAGE_REORDERED: [[[u32; 2]; 2 * IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = {
+        let mut tagged_image = TAGGED_IMAGE;
+
+        let mut y = 0;
+        while y < IMAGE_HEIGHT_USIZE {
+            let mut x = 0;
+            while x < IMAGE_WIDTH_USIZE {
+                let tagged_pixel = tagged_image[y][x << 1];
+                let pos = IMAGE_REORDER[y][x];
+                tagged_image[y][const_u32_to_usize(pos) << 1 | 1] = tagged_pixel;
+
+                x += 1;
+            }
+
+            y += 1;
+        }
+
+        tagged_image
+    };
+
+    #[derive(Clone, Copy, Default)]
+    enum BufferSetup<T, Size = u64> {
+        #[default]
+        None,
+        Uninitialised(Size),
+        UninitialisedFrom(T),
+        Initialised(T),
+    }
+    struct Buffer {
+        buffer: wgpu::Buffer,
+        layout: wgpu::BindGroupLayoutEntry,
+    }
+    impl Buffer {
+        fn create<E: bytemuck::Pod>(
+            setup: BufferSetup<&'_ [E]>,
+            device: &wgpu::Device,
+            label: &'static str,
+            binding: u32,
+        ) -> Self {
+            let t_size = const { const_size_of_u64::<E>() };
+            let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+
+            let buffer = match setup {
+                BufferSetup::None => device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: t_size,
+                    usage,
+                    mapped_at_creation: false,
+                }),
+                BufferSetup::Uninitialised(size) => device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size,
+                    usage,
+                    mapped_at_creation: false,
+                }),
+                BufferSetup::UninitialisedFrom(value) => {
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(label),
+                        size: u64::try_from(value.len())
+                            .unwrap()
+                            .checked_mul(t_size)
+                            .unwrap(),
+                        usage,
+                        mapped_at_creation: false,
+                    })
+                }
+                BufferSetup::Initialised(value) => {
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: bytemuck::cast_slice(value),
+                        usage,
+                    })
+                }
+            };
+            let layout = wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: Some(NonZero::new(t_size).unwrap()),
+                },
+                count: None,
+            };
+
+            Self { buffer, layout }
+        }
+
+        fn entry(&self) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry {
+                binding: self.layout.binding,
+                resource: self.buffer.as_entire_binding(),
+            }
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DownloadSource {
+        Image,
+        TaggedImage,
+        TestBuffer,
+    }
+    #[derive(Default)]
+    struct Setup<Image, TaggedImage, TestBuffer> {
+        image: BufferSetup<Image>,
+        tagged_image: BufferSetup<TaggedImage>,
+        test_buffer: BufferSetup<TestBuffer>,
+    }
+    struct Instance {
+        state: &'static State,
+        image: Buffer,
+        tagged_image: Buffer,
+        bind_group: wgpu::BindGroup,
+        test_buffer: Buffer,
+        test_bind_group: wgpu::BindGroup,
+        pipeline: wgpu::ComputePipeline,
+        download_source: DownloadSource,
+        download: wgpu::Buffer,
+    }
+    fn setup(
+        options: Setup<
+            Option<&'_ [[u32; IMAGE_WIDTH_USIZE]]>,
+            Option<&'_ [[[u32; 2]; 2 * IMAGE_WIDTH_USIZE]]>,
+            &'_ [u32],
+        >,
+        entry_point: &str,
+        download_source: DownloadSource,
+    ) -> Instance {
+        let state = get_state();
+        let State { device, module, .. } = state;
+
+        let Setup {
+            image,
+            tagged_image,
+            test_buffer,
+        } = options;
+        let options = Setup {
+            image: match image {
+                BufferSetup::None => BufferSetup::None,
+                BufferSetup::Uninitialised(size) => BufferSetup::Uninitialised(size),
+                BufferSetup::UninitialisedFrom(value) => {
+                    BufferSetup::UninitialisedFrom(value.unwrap_or(&IMAGE))
+                }
+                BufferSetup::Initialised(value) => {
+                    BufferSetup::Initialised(value.unwrap_or(&IMAGE))
+                }
+            },
+            tagged_image: match tagged_image {
+                BufferSetup::None => BufferSetup::None,
+                BufferSetup::Uninitialised(size) => BufferSetup::Uninitialised(size),
+                BufferSetup::UninitialisedFrom(value) => {
+                    BufferSetup::UninitialisedFrom(value.unwrap_or(&TAGGED_IMAGE))
+                }
+                BufferSetup::Initialised(value) => {
+                    BufferSetup::Initialised(value.unwrap_or(&TAGGED_IMAGE))
+                }
+            },
+            test_buffer,
+        };
+
+        let image = Buffer::create(options.image, device, "image", 0);
+        let tagged_image = Buffer::create(options.tagged_image, device, "tagged_image", 1);
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bind_group_layout"),
+            entries: &[image.layout, tagged_image.layout],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bind_group"),
+            layout: &bind_group_layout,
+            entries: &[image.entry(), tagged_image.entry()],
+        });
+
+        let test_buffer = Buffer::create(options.test_buffer, device, "test_buffer", 0);
+
+        let test_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("bind_group_layout"),
+                entries: &[test_buffer.layout],
+            });
+        let test_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bind_group"),
+            layout: &test_bind_group_layout,
+            entries: &[test_buffer.entry()],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&test_bind_group_layout)],
+            immediate_size: const { const_size_of_u32::<Immediates>() },
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            module,
+            entry_point: Some(entry_point),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &COMPILATION_CONSTANTS,
+                ..wgpu::PipelineCompilationOptions::default()
+            },
+            cache: None,
+        });
+
+        let download = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("download"),
+            size: match download_source {
+                DownloadSource::Image => &image,
+                DownloadSource::TaggedImage => &tagged_image,
+                DownloadSource::TestBuffer => &test_buffer,
+            }
+            .buffer
+            .size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        Instance {
+            state,
+            image,
+            tagged_image,
+            bind_group,
+            test_buffer,
+            test_bind_group,
+            pipeline,
+            download_source,
+            download,
+        }
+    }
+    impl Instance {
+        fn submit(&self) -> wgpu::BufferView {
+            let mut encoder =
+                self.state
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("encoder"),
+                    });
+
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("compute_pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.pipeline);
+            compute_pass.set_bind_group(0, &self.bind_group, &[]);
+            compute_pass.set_bind_group(1, &self.test_bind_group, &[]);
+            compute_pass.set_immediates(
+                0,
+                bytemuck::bytes_of(&Immediates {
+                    width: IMAGE_SIZE.x,
+                    block_size: BLOCK_SIZE,
+                    threshold: THRESHOLD,
+                }),
+            );
+            compute_pass.dispatch_workgroups(1, IMAGE_SIZE.y, 1);
+            drop(compute_pass);
+
+            let download_source = &match self.download_source {
+                DownloadSource::Image => &self.image,
+                DownloadSource::TaggedImage => &self.tagged_image,
+                DownloadSource::TestBuffer => &self.test_buffer,
+            }
+            .buffer;
+            encoder.copy_buffer_to_buffer(
+                download_source,
+                0,
+                &self.download,
+                0,
+                download_source.size(),
+            );
+            encoder.map_buffer_on_submit(&self.download, wgpu::MapMode::Read, .., |_| {});
+
+            let ix = self.state.queue.submit([encoder.finish()]);
+            self.state
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(ix),
+                    timeout: None,
+                })
+                .unwrap();
+
+            self.download.get_mapped_range(..).unwrap()
+        }
+    }
+
+    #[test]
+    fn change_count() {
+        let instance = setup(
+            Setup {
+                image: BufferSetup::Initialised(None),
+                test_buffer: BufferSetup::UninitialisedFrom(
+                    PREVIOUS_BLOCK_CHANGE_COUNT.as_flattened(),
+                ),
+                ..Setup::default()
+            },
+            "test_change_count",
+            DownloadSource::TestBuffer,
+        );
+
+        let downloaded = instance.submit();
+        let result = bytemuck::cast_slice::<u8, [u32; _]>(&downloaded);
+
+        assert_eq!(result, PREVIOUS_BLOCK_CHANGE_COUNT);
+    }
+
+    #[test]
+    fn wg_partial_sum() {
+        let instance = setup(
+            Setup {
+                image: BufferSetup::Initialised(None),
+                test_buffer: BufferSetup::UninitialisedFrom(PREVIOUS_BLOCK_TAG.as_flattened()),
+                ..Setup::default()
+            },
+            "test_wg_partial_sum",
+            DownloadSource::TestBuffer,
+        );
+
+        let downloaded = instance.submit();
+        let result = bytemuck::cast_slice::<u8, [u32; _]>(&downloaded);
+
+        assert_eq!(result, PREVIOUS_BLOCK_TAG);
+    }
+
+    #[test]
+    fn label_regions() {
+        let instance = setup(
+            Setup {
+                image: BufferSetup::Initialised(None),
+                tagged_image: BufferSetup::UninitialisedFrom(None),
+                ..Setup::default()
+            },
+            "test_label_regions",
+            DownloadSource::TaggedImage,
+        );
+
+        let downloaded = instance.submit();
+        let result = bytemuck::cast_slice::<u8, [[u32; 2]; _]>(&downloaded);
+
+        assert_eq!(result, TAGGED_IMAGE);
+    }
+
+    #[test]
+    fn p_count() {
+        let instance = setup(
+            Setup {
+                tagged_image: BufferSetup::Initialised(None),
+                test_buffer: BufferSetup::UninitialisedFrom(bytemuck::cast_slice(&TAG_P_COUNT)),
+                ..Setup::default()
+            },
+            "test_p_count",
+            DownloadSource::TestBuffer,
+        );
+
+        let downloaded = instance.submit();
+        let result = bytemuck::cast_slice::<u8, [[u32; _]; _]>(&downloaded);
+
+        assert_eq!(result, TAG_P_COUNT);
+    }
+
+    #[test]
+    fn wg_partial_sum_counts() {
+        let instance = setup(
+            Setup {
+                test_buffer: BufferSetup::Initialised(bytemuck::cast_slice(&TAG_P_COUNT)),
+                ..Setup::default()
+            },
+            "test_wg_partial_sum_counts",
+            DownloadSource::TestBuffer,
+        );
+
+        let downloaded = instance.submit();
+        let result = bytemuck::cast_slice::<u8, [[u32; _]; _]>(&downloaded);
+
+        assert_eq!(result, TAG_COUNT_PARTIAL_SUM);
+    }
+
+    #[test]
+    fn reorder() {
+        let instance = setup(
+            Setup {
+                tagged_image: BufferSetup::Initialised(None),
+                test_buffer: BufferSetup::Initialised(bytemuck::cast_slice(
+                    &VALUE_COUNT_PARTIAL_SUM,
+                )),
+                ..Setup::default()
+            },
+            "test_reorder",
+            DownloadSource::TaggedImage,
+        );
+
+        let downloaded = instance.submit();
+        let result = bytemuck::cast_slice::<u8, [[u32; _]; _]>(&downloaded);
+
+        assert_eq!(result, TAGGED_IMAGE_REORDERED);
+    }
+
+    #[test]
+    fn partial_sort() {
+        let instance = setup(
+            Setup {
+                tagged_image: BufferSetup::Initialised(None),
+                ..Setup::default()
+            },
+            "test_partial_sort",
+            DownloadSource::TaggedImage,
+        );
+
+        let downloaded = instance.submit();
+        let result = bytemuck::cast_slice::<u8, [[u32; _]; _]>(&downloaded);
+
+        assert_eq!(result, TAGGED_IMAGE_REORDERED);
+    }
+
+    #[test]
+    fn partial_sort2() {
+        let mut reordered = [[[0; 2]; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE];
+        for (pos, pixel) in TAGGED_IMAGE_REORDERED
+            .as_flattened()
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .enumerate()
+        {
+            reordered.as_flattened_mut()[pos] = *pixel;
+        }
+        let expected = reordered.map(|mut row| {
+            row.sort_by_key(|[tag, _rgb]| tag & 0xf0000);
+            row
+        });
+
+        let instance = setup(
+            Setup {
+                tagged_image: BufferSetup::Initialised(None),
+                test_buffer: BufferSetup::UninitialisedFrom(bytemuck::cast_slice(&expected)),
+                ..Setup::default()
+            },
+            "test_partial_sort2",
+            DownloadSource::TestBuffer,
+        );
+
+        let downloaded = instance.submit();
+        let result = bytemuck::cast_slice::<u8, [[u32; 2]; IMAGE_WIDTH_USIZE]>(&downloaded);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sort() {
+        let mut tagged = [[[0; 2]; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE];
+        for (pos, pixel) in TAGGED_IMAGE.as_flattened().iter().step_by(2).enumerate() {
+            tagged.as_flattened_mut()[pos] = *pixel;
+        }
+        let expected = tagged.map(|mut row| {
+            row.sort_by_key(|[tag, _rgb]| *tag);
+            row
+        });
+
+        let instance = setup(
+            Setup {
+                tagged_image: BufferSetup::Initialised(None),
+                test_buffer: BufferSetup::UninitialisedFrom(bytemuck::cast_slice(&expected)),
+                ..Setup::default()
+            },
+            "test_sort",
+            DownloadSource::TestBuffer,
+        );
+
+        let downloaded = instance.submit();
+        let result = bytemuck::cast_slice::<u8, [[u32; 2]; IMAGE_WIDTH_USIZE]>(&downloaded);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn full() {
+        let State { device, queue, .. } = get_state();
+
+        let pixel_sort = PixelSort::new(device, WORKGROUP_SIZE, IMAGE_PIXELS);
+
+        let image = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&IMAGE),
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+        let download = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: pixel_sort
+                .tagged_image
+                .size()
+                .checked_add(pixel_sort.image.size())
+                .unwrap(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        pixel_sort.add_step(&mut encoder, IMAGE_SIZE, THRESHOLD, &image);
+        encoder.copy_buffer_to_buffer(
+            &pixel_sort.tagged_image,
+            0,
+            &download,
+            0,
+            pixel_sort.tagged_image.size(),
+        );
+        encoder.copy_buffer_to_buffer(
+            &pixel_sort.image,
+            0,
+            &download,
+            pixel_sort.tagged_image.size(),
+            pixel_sort.image.size(),
+        );
+        encoder.map_buffer_on_submit(&download, wgpu::MapMode::Read, .., |_| {});
+        let ix = queue.submit([encoder.finish()]);
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(ix),
+                timeout: None,
+            })
+            .unwrap();
+
+        let tagged_image_bytes = download
+            .get_mapped_range(..pixel_sort.tagged_image.size())
+            .unwrap();
+        let tagged_image = bytemuck::from_bytes::<
+            [[[u32; 2]; 2 * IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE],
+        >(&tagged_image_bytes);
+        let active_tagged_image = tagged_image.map(|row| {
+            let mut new = [[0; 2]; IMAGE_WIDTH_USIZE];
+            row.iter()
+                .step_by(2)
+                .zip(&mut new)
+                .for_each(|(a, b)| *b = *a);
+            new
+        });
+
+        let image_bytes = download
+            .get_mapped_range(pixel_sort.tagged_image.size()..)
+            .unwrap();
+        let image =
+            bytemuck::from_bytes::<[[u32; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE]>(&image_bytes);
+
+        let mut tagged = [[[0; 2]; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE];
+        for (pos, pixel) in TAGGED_IMAGE.as_flattened().iter().step_by(2).enumerate() {
+            tagged.as_flattened_mut()[pos] = *pixel;
+        }
+        let expected = tagged.map(|mut row| {
+            row.sort_by_key(|[tag, _rgb]| *tag);
+            row
+        });
+        let expected_image = expected.map(|row| row.map(|[_tag, rgb]| rgb));
+
+        assert_eq!(active_tagged_image, expected);
+        assert_eq!(image, &expected_image);
     }
 }

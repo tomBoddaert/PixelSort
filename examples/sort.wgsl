@@ -5,7 +5,7 @@ struct Immediates {
 var<immediate> immediates: Immediates;
 
 @group(0) @binding(0)
-var<storage, read> tagged_image: array<vec2<u32>>;
+var<storage, read> image: array<u32>;
 
 @vertex
 fn vertex(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
@@ -26,13 +26,12 @@ fn fragment(@builtin(position) coord_in: vec4<f32>) -> @location(0) vec4<f32> {
     let scale_factor = min(scale_factors.x, scale_factors.y);
 
     let coord = vec2<u32>(coord_in.xy / scale_factor);
-    if (coord.x > immediates.image_size.x || coord.y > immediates.image_size.y) {
+    if (coord.x >= immediates.image_size.x || coord.y >= immediates.image_size.y) {
         discard;
     }
 
     let i = coord.y * immediates.image_size.x + coord.x;
-    let tagged_pixel = tagged_image[i];
-    let rgb = unpack4x8unorm(tagged_pixel.y).xyz;
+    let rgb = unpack4x8unorm(image[i]).xyz;
 
     return vec4(rgb, 1);
 }

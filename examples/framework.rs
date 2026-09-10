@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use pixel_sort::{Vec2U32, WorkgroupInfo, const_max_u32_slice, const_size_of_u32};
+use pixel_sort::{Vec2U32, const_max_u32_slice, const_size_of_u32};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -16,7 +16,7 @@ pub trait Example: Sized {
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        workgroup_info: WorkgroupInfo,
+        workgroup_size: u32,
         image: wgpu::Buffer,
         image_size: Vec2U32,
     ) -> (
@@ -127,6 +127,7 @@ impl<E: Example> State<E> {
             pixel_sort::IMMEDIATES_SIZE,
             const_size_of_u32::<E::Immediates>(),
         ]);
+        required_limits.max_storage_buffer_binding_size = 200540160; // TODO: tmp value
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
@@ -144,11 +145,6 @@ impl<E: Example> State<E> {
         let surface_capabilities = surface.get_capabilities(&adapter);
         let surface_format = surface_capabilities.formats[0];
 
-        let workgroup_info = WorkgroupInfo {
-            workgroup_size: adapter.get_info().subgroup_max_size,
-            max_workgroups: 64,
-        };
-
         let img = image::ImageReader::open("source.jpg")
             .unwrap()
             .decode()
@@ -164,8 +160,13 @@ impl<E: Example> State<E> {
             y: img.height(),
         };
 
-        let (example, module, bind_group_layout, bind_group) =
-            E::new(&device, &queue, workgroup_info, image, image_size);
+        let (example, module, bind_group_layout, bind_group) = E::new(
+            &device,
+            &queue,
+            adapter.get_info().subgroup_max_size,
+            image,
+            image_size,
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
