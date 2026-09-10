@@ -55,7 +55,7 @@ impl App {
         let wgpu_render_state = cc.wgpu_render_state.as_ref().unwrap();
         let device = &wgpu_render_state.device;
 
-        let img = image::ImageReader::open("source.jpg")
+        let img = image::ImageReader::open("examples/source.jpg")
             .unwrap()
             .decode()
             .unwrap()

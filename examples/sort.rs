@@ -1,4 +1,4 @@
-use pixel_sort::{U32_SIZE, Vec2U32};
+use pixel_sort::{U32_SIZE, U64_SIZE, Vec2U32};
 
 mod framework;
 
@@ -12,6 +12,13 @@ struct PixelSort {
 
 impl framework::Example for PixelSort {
     type Immediates = Immediates;
+
+    fn get_max_buffer_size(image_size: Vec2U32) -> u64 {
+        image_size
+            .product()
+            .checked_mul(U64_SIZE.get() * 2)
+            .unwrap()
+    }
 
     fn new(
         device: &wgpu::Device,

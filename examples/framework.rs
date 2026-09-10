@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use pixel_sort::{Vec2U32, const_max_u32_slice, const_size_of_u32};
+use pixel_sort::{U32_SIZE, Vec2U32, const_max_u32_slice, const_size_of_u32};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -12,6 +12,11 @@ fn main() {
 
 pub trait Example: Sized {
     type Immediates: bytemuck::Pod;
+
+    #[expect(unused_variables)]
+    fn get_max_buffer_size(image_size: Vec2U32) -> u64 {
+        0
+    }
 
     fn new(
         device: &wgpu::Device,
@@ -107,6 +112,16 @@ impl<E: Example> State<E> {
         display: winit::event_loop::OwnedDisplayHandle,
         window: Arc<winit::window::Window>,
     ) -> Self {
+        let img = image::ImageReader::open("examples/source.jpg")
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgba8();
+        let image_size = Vec2U32 {
+            x: img.width(),
+            y: img.height(),
+        };
+
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(display),
         ));
@@ -129,6 +144,15 @@ impl<E: Example> State<E> {
                 const_size_of_u32::<E::Immediates>(),
             ])
         };
+        let max_buffer_size = (Vec2U32 {
+            x: img.width(),
+            y: img.height(),
+        }
+        .product()
+            * U32_SIZE.get())
+        .max(E::get_max_buffer_size(image_size));
+        required_limits.max_storage_buffer_binding_size = max_buffer_size;
+        required_limits.max_buffer_size = max_buffer_size;
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
@@ -146,20 +170,11 @@ impl<E: Example> State<E> {
         let surface_capabilities = surface.get_capabilities(&adapter);
         let surface_format = surface_capabilities.formats[0];
 
-        let img = image::ImageReader::open("source.jpg")
-            .unwrap()
-            .decode()
-            .unwrap()
-            .into_rgba8();
         let image = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: &img,
             usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
         });
-        let image_size = Vec2U32 {
-            x: img.width(),
-            y: img.height(),
-        };
 
         let (example, module, bind_group_layout, bind_group) = E::new(
             &device,
