@@ -123,11 +123,12 @@ impl<E: Example> State<E> {
         }
 
         let mut required_limits = wgpu::Limits::defaults();
-        required_limits.max_immediate_size = const_max_u32_slice(&[
-            pixel_sort::IMMEDIATES_SIZE,
-            const_size_of_u32::<E::Immediates>(),
-        ]);
-        required_limits.max_storage_buffer_binding_size = 200540160; // TODO: tmp value
+        required_limits.max_immediate_size = const {
+            const_max_u32_slice(&[
+                pixel_sort::IMMEDIATES_SIZE,
+                const_size_of_u32::<E::Immediates>(),
+            ])
+        };
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
