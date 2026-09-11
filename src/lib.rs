@@ -13,8 +13,9 @@ const TEST_COPY_SRC: wgpu::BufferUsages = wgpu::BufferUsages::COPY_SRC;
 
 pub struct PixelSort {
     pub max_pixels: u64,
-    pub image: wgpu::Buffer,
+    pub input: wgpu::Buffer,
     pub tagged_image: wgpu::Buffer,
+    pub output: wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
     pub pipeline: wgpu::ComputePipeline,
     pub workgroup_size: u32,
@@ -24,25 +25,25 @@ impl PixelSort {
     pub fn new(device: &wgpu::Device, workgroup_size: u32, max_pixels: u64) -> Self {
         let module = device.create_shader_module(wgpu::include_wgsl!("pixel_sort.wgsl"));
 
-        let image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("PixelSort::image"),
+        let input = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("PixelSort::input"),
             size: max_pixels.checked_mul(U32_SIZE.get()).unwrap(),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | TEST_COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let image_layout = wgpu::BindGroupLayoutEntry {
+        let input_layout = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
                 has_dynamic_offset: false,
                 min_binding_size: Some(U32_SIZE),
             },
             count: None,
         };
-        let image_entry = wgpu::BindGroupEntry {
-            binding: image_layout.binding,
-            resource: image.as_entire_binding(),
+        let input_entry = wgpu::BindGroupEntry {
+            binding: input_layout.binding,
+            resource: input.as_entire_binding(),
         };
 
         let tagged_image = device.create_buffer(&wgpu::BufferDescriptor {
@@ -66,14 +67,35 @@ impl PixelSort {
             resource: tagged_image.as_entire_binding(),
         };
 
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("PixelSort::output"),
+            size: input.size(),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let output_layout = wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: Some(U32_SIZE),
+            },
+            count: None,
+        };
+        let output_entry = wgpu::BindGroupEntry {
+            binding: output_layout.binding,
+            resource: output.as_entire_binding(),
+        };
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("PixelSort bind_group_layout"),
-            entries: &[image_layout, tagged_image_layout],
+            entries: &[input_layout, tagged_image_layout, output_layout],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("PixelSort::bind_group"),
             layout: &bind_group_layout,
-            entries: &[image_entry, tagged_image_entry],
+            entries: &[input_entry, tagged_image_entry, output_entry],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -96,12 +118,35 @@ impl PixelSort {
 
         Self {
             max_pixels,
-            image,
+            input,
             tagged_image,
+            output,
             bind_group,
             pipeline,
             workgroup_size,
         }
+    }
+
+    pub fn copy_to_input(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        image: &wgpu::Buffer,
+        image_size: Vec2U32,
+    ) {
+        let pixels = image_size.product();
+        assert!(pixels <= self.max_pixels);
+        encoder.copy_buffer_to_buffer(image, 0, &self.input, 0, pixels * U32_SIZE.get());
+    }
+
+    pub fn copy_from_output(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::Buffer,
+        image_size: Vec2U32,
+    ) {
+        let pixels = image_size.product();
+        assert!(pixels <= self.max_pixels);
+        encoder.copy_buffer_to_buffer(&self.output, 0, output, 0, pixels * U32_SIZE.get());
     }
 
     pub fn add_step(
@@ -109,12 +154,9 @@ impl PixelSort {
         encoder: &mut wgpu::CommandEncoder,
         image_size: Vec2U32,
         threshold: f32,
-        image: &wgpu::Buffer,
     ) {
         let pixels = image_size.product();
         assert!(pixels <= self.max_pixels);
-
-        encoder.copy_buffer_to_buffer(image, 0, &self.image, 0, pixels * U32_SIZE.get());
 
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("PixelSort compute_pass"),
@@ -229,7 +271,7 @@ mod test {
 
     use crate::{
         BASE, IMMEDIATES_SIZE, Immediates, PixelSort, Vec2U32, const_size_of_u32,
-        const_size_of_u64, const_u32_to_usize, const_u64_to_usize,
+        const_size_of_u64, const_size_of_value_u64, const_u32_to_usize, const_u64_to_usize,
     };
 
     struct State {
@@ -523,6 +565,7 @@ mod test {
             device: &wgpu::Device,
             label: &'static str,
             binding: u32,
+            read_only: bool,
         ) -> Self {
             let t_size = const { const_size_of_u64::<E>() };
             let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
@@ -563,7 +606,7 @@ mod test {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    ty: wgpu::BufferBindingType::Storage { read_only },
                     has_dynamic_offset: false,
                     min_binding_size: Some(NonZero::new(t_size).unwrap()),
                 },
@@ -582,20 +625,22 @@ mod test {
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum DownloadSource {
-        Image,
+        Output,
         TaggedImage,
         TestBuffer,
     }
     #[derive(Default)]
-    struct Setup<Image, TaggedImage, TestBuffer> {
-        image: BufferSetup<Image>,
+    struct Setup<Input, TaggedImage, Output, OutputSize, TestBuffer> {
+        input: BufferSetup<Input>,
         tagged_image: BufferSetup<TaggedImage>,
+        output: BufferSetup<Output, OutputSize>,
         test_buffer: BufferSetup<TestBuffer>,
     }
     struct Instance {
         state: &'static State,
-        image: Buffer,
+        input: Buffer,
         tagged_image: Buffer,
+        output: Buffer,
         bind_group: wgpu::BindGroup,
         test_buffer: Buffer,
         test_bind_group: wgpu::BindGroup,
@@ -607,6 +652,8 @@ mod test {
         options: Setup<
             Option<&'_ [[u32; IMAGE_WIDTH_USIZE]]>,
             Option<&'_ [[[u32; 2]; 2 * IMAGE_WIDTH_USIZE]]>,
+            &'_ [[u32; IMAGE_WIDTH_USIZE]],
+            Option<u64>,
             &'_ [u32],
         >,
         entry_point: &str,
@@ -616,12 +663,13 @@ mod test {
         let State { device, module, .. } = state;
 
         let Setup {
-            image,
+            input,
             tagged_image,
+            output,
             test_buffer,
         } = options;
         let options = Setup {
-            image: match image {
+            input: match input {
                 BufferSetup::None => BufferSetup::None,
                 BufferSetup::Uninitialised(size) => BufferSetup::Uninitialised(size),
                 BufferSetup::UninitialisedFrom(value) => {
@@ -641,23 +689,32 @@ mod test {
                     BufferSetup::Initialised(value.unwrap_or(&TAGGED_IMAGE))
                 }
             },
+            output: match output {
+                BufferSetup::None => BufferSetup::None,
+                BufferSetup::Uninitialised(size) => {
+                    BufferSetup::Uninitialised(size.unwrap_or(const_size_of_value_u64(&IMAGE)))
+                }
+                BufferSetup::UninitialisedFrom(value) => BufferSetup::UninitialisedFrom(value),
+                BufferSetup::Initialised(value) => BufferSetup::Initialised(value),
+            },
             test_buffer,
         };
 
-        let image = Buffer::create(options.image, device, "image", 0);
-        let tagged_image = Buffer::create(options.tagged_image, device, "tagged_image", 1);
+        let input = Buffer::create(options.input, device, "input", 0, true);
+        let tagged_image = Buffer::create(options.tagged_image, device, "tagged_image", 1, false);
+        let output = Buffer::create(options.input, device, "output", 2, false);
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bind_group_layout"),
-            entries: &[image.layout, tagged_image.layout],
+            entries: &[input.layout, tagged_image.layout, output.layout],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bind_group"),
             layout: &bind_group_layout,
-            entries: &[image.entry(), tagged_image.entry()],
+            entries: &[input.entry(), tagged_image.entry(), output.entry()],
         });
 
-        let test_buffer = Buffer::create(options.test_buffer, device, "test_buffer", 0);
+        let test_buffer = Buffer::create(options.test_buffer, device, "test_buffer", 0, false);
 
         let test_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -690,7 +747,7 @@ mod test {
         let download = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("download"),
             size: match download_source {
-                DownloadSource::Image => &image,
+                DownloadSource::Output => &output,
                 DownloadSource::TaggedImage => &tagged_image,
                 DownloadSource::TestBuffer => &test_buffer,
             }
@@ -702,8 +759,9 @@ mod test {
 
         Instance {
             state,
-            image,
+            input,
             tagged_image,
+            output,
             bind_group,
             test_buffer,
             test_bind_group,
@@ -740,7 +798,7 @@ mod test {
             drop(compute_pass);
 
             let download_source = &match self.download_source {
-                DownloadSource::Image => &self.image,
+                DownloadSource::Output => &self.output,
                 DownloadSource::TaggedImage => &self.tagged_image,
                 DownloadSource::TestBuffer => &self.test_buffer,
             }
@@ -771,7 +829,7 @@ mod test {
     fn change_count() {
         let instance = setup(
             Setup {
-                image: BufferSetup::Initialised(None),
+                input: BufferSetup::Initialised(None),
                 test_buffer: BufferSetup::UninitialisedFrom(
                     PREVIOUS_BLOCK_CHANGE_COUNT.as_flattened(),
                 ),
@@ -791,7 +849,7 @@ mod test {
     fn wg_partial_sum() {
         let instance = setup(
             Setup {
-                image: BufferSetup::Initialised(None),
+                input: BufferSetup::Initialised(None),
                 test_buffer: BufferSetup::UninitialisedFrom(PREVIOUS_BLOCK_TAG.as_flattened()),
                 ..Setup::default()
             },
@@ -809,7 +867,7 @@ mod test {
     fn label_regions() {
         let instance = setup(
             Setup {
-                image: BufferSetup::Initialised(None),
+                input: BufferSetup::Initialised(None),
                 tagged_image: BufferSetup::UninitialisedFrom(None),
                 ..Setup::default()
             },
@@ -971,7 +1029,7 @@ mod test {
             size: pixel_sort
                 .tagged_image
                 .size()
-                .checked_add(pixel_sort.image.size())
+                .checked_add(pixel_sort.input.size())
                 .unwrap(),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -979,7 +1037,8 @@ mod test {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        pixel_sort.add_step(&mut encoder, IMAGE_SIZE, THRESHOLD, &image);
+        pixel_sort.copy_to_input(&mut encoder, &image, IMAGE_SIZE);
+        pixel_sort.add_step(&mut encoder, IMAGE_SIZE, THRESHOLD);
         encoder.copy_buffer_to_buffer(
             &pixel_sort.tagged_image,
             0,
@@ -988,11 +1047,11 @@ mod test {
             pixel_sort.tagged_image.size(),
         );
         encoder.copy_buffer_to_buffer(
-            &pixel_sort.image,
+            &pixel_sort.output,
             0,
             &download,
             pixel_sort.tagged_image.size(),
-            pixel_sort.image.size(),
+            pixel_sort.input.size(),
         );
         encoder.map_buffer_on_submit(&download, wgpu::MapMode::Read, .., |_| {});
         let ix = queue.submit([encoder.finish()]);

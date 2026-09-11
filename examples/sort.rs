@@ -46,14 +46,15 @@ impl framework::Example for PixelSort {
         };
         let image_entry = wgpu::BindGroupEntry {
             binding: image_layout.binding,
-            resource: ps.image.as_entire_binding(),
+            resource: ps.output.as_entire_binding(),
         };
 
         const THRESHOLD: f32 = 0.4;
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        ps.add_step(&mut encoder, image_size, THRESHOLD, &image);
+        ps.copy_to_input(&mut encoder, &image, image_size);
+        ps.add_step(&mut encoder, image_size, THRESHOLD);
         let idx = queue.submit([encoder.finish()]);
         device
             .poll(wgpu::PollType::Wait {

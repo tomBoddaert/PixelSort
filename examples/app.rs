@@ -1,10 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::{
+    borrow::Borrow,
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use eframe::{egui, egui_wgpu};
 use pixel_sort::{PixelSort, U32_SIZE, U64_SIZE, Vec2U32, const_max_u32_slice, const_size_of_u32};
-use wgpu::util::DeviceExt;
 
 fn main() -> eframe::Result {
     env_logger::init();
@@ -46,7 +50,11 @@ fn main() -> eframe::Result {
 }
 
 struct App {
-    first: bool,
+    open_image_extensions: Vec<&'static str>,
+    save_image_extensions: Vec<&'static str>,
+    initial_image: Option<image::RgbaImage>,
+    current_image: PathBuf,
+    image_size: Vec2U32,
     threshold: f32,
 }
 
@@ -55,20 +63,21 @@ impl App {
         let wgpu_render_state = cc.wgpu_render_state.as_ref().unwrap();
         let device = &wgpu_render_state.device;
 
-        let img = image::ImageReader::open("examples/source.jpg")
-            .unwrap()
-            .decode()
-            .unwrap()
-            .into_rgba8();
-        let image = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: &img,
+        let current_image = std::path::absolute("examples/source.jpg").unwrap();
+        let (img, image_size) = read_image(&current_image);
+
+        let upload = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("upload"),
+            size: const { MAX_IMAGE_PIXELS * U32_SIZE.get() },
             usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
         });
-        let image_size = Vec2U32 {
-            x: img.width(),
-            y: img.height(),
-        };
+        let download = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("download"),
+            size: upload.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
         let workgroup_size = wgpu_render_state.adapter.get_info().subgroup_max_size;
 
@@ -88,7 +97,7 @@ impl App {
         };
         let image_entry = wgpu::BindGroupEntry {
             binding: image_layout.binding,
-            resource: sort.image.as_entire_binding(),
+            resource: sort.output.as_entire_binding(),
         };
 
         let render_bind_group_layout =
@@ -135,15 +144,27 @@ impl App {
             .write()
             .callback_resources
             .insert(ViewerResources {
-                image,
-                image_size,
+                upload,
+                download,
                 sort,
                 render_bind_group,
                 render_pipeline,
             });
 
         Self {
-            first: true,
+            open_image_extensions: image::ImageFormat::all()
+                .filter(image::ImageFormat::reading_enabled)
+                .flat_map(image::ImageFormat::extensions_str)
+                .copied()
+                .collect(),
+            save_image_extensions: image::ImageFormat::all()
+                .filter(image::ImageFormat::writing_enabled)
+                .flat_map(image::ImageFormat::extensions_str)
+                .copied()
+                .collect(),
+            initial_image: Some(img),
+            current_image,
+            image_size,
             threshold: 0.5,
         }
     }
@@ -153,23 +174,61 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal_top(|ui| {
-                let mut updated = false;
+                let mut image_update = None;
+                let mut threshold_updated = false;
 
                 ui.vertical(|ui| {
                     ui.heading("Pixel Sort");
                     let slider = ui.add(egui::Slider::new(&mut self.threshold, 0.0..=1.0));
-                    updated = slider.changed();
+                    threshold_updated = slider.changed();
+
+                    if ui.button("Open image file").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("image", &self.open_image_extensions)
+                            .set_directory(self.current_image.parent().unwrap())
+                            .pick_file()
+                    {
+                        let (img, image_size) = read_image(&path);
+                        self.image_size = image_size;
+                        self.current_image = path;
+                        image_update = Some(img);
+                    }
+
+                    if ui.button("Save image").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("image", &self.save_image_extensions)
+                            .set_directory(self.current_image.parent().unwrap())
+                            .set_file_name({
+                                let mut file_name =
+                                    PathBuf::from(self.current_image.file_name().unwrap());
+                                file_name.set_extension("");
+                                let mut file_name = OsString::from(file_name);
+                                file_name.push(" pixel-sorted");
+                                let mut file_name = PathBuf::from(file_name);
+                                file_name.set_extension(
+                                    self.current_image.extension().unwrap_or(OsStr::new("")),
+                                );
+
+                                file_name.into_os_string().into_string().unwrap()
+                            })
+                            .save_file()
+                    {
+                        let render_state = frame.wgpu_render_state().unwrap();
+                        download_write_image(render_state, self.image_size, &path);
+                    }
                 });
 
-                if self.first {
-                    self.first = false;
-                    updated = true;
+                if let Some(initial_image) = self.initial_image.take() {
+                    image_update = Some(image_update.unwrap_or(initial_image));
                 }
 
                 ui.add(Viewer {
                     size: ui.available_size(),
-                    updated: AtomicBool::new(updated),
+                    image_size: self.image_size,
+                    image_updated: AtomicBool::new(image_update.is_some()),
+                    image: image_update,
                     threshold: self.threshold,
+                    threshold_updated: AtomicBool::new(threshold_updated),
                 });
             })
         });
@@ -178,8 +237,11 @@ impl eframe::App for App {
 
 struct Viewer {
     size: egui::Vec2,
-    updated: AtomicBool,
+    image_size: Vec2U32,
+    image: Option<image::RgbaImage>,
+    image_updated: AtomicBool,
     threshold: f32,
+    threshold_updated: AtomicBool,
 }
 
 impl egui::Widget for Viewer {
@@ -211,21 +273,38 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
     ) -> Vec<wgpu::CommandBuffer> {
         let Viewer {
             size,
-            updated,
+            image_size,
+            image,
+            image_updated,
             threshold,
+            threshold_updated,
         } = &self.viewer;
-        if !updated.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        let threshold_update = threshold_updated.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let image_update = image_updated.swap(false, std::sync::atomic::Ordering::AcqRel);
+        if !(threshold_update || image_update) {
             return Vec::new();
         }
 
-        let ViewerResources {
-            image,
-            image_size,
-            sort,
-            ..
-        } = callback_resources.get::<ViewerResources>().unwrap();
+        let ViewerResources { upload, sort, .. } =
+            callback_resources.get::<ViewerResources>().unwrap();
 
-        sort.add_step(egui_encoder, *image_size, *threshold, image);
+        if image_update && let Some(image) = image {
+            let image_byte_len = Vec2U32 {
+                x: image.width(),
+                y: image.height(),
+            }
+            .product()
+                * U32_SIZE.get();
+            let mut mapped = upload.get_mapped_range_mut(..image_byte_len).unwrap();
+            mapped.copy_from_slice(bytemuck::cast_slice(image));
+            drop(mapped);
+            upload.unmap();
+
+            sort.copy_to_input(egui_encoder, upload, *image_size);
+            egui_encoder.map_buffer_on_submit(upload, wgpu::MapMode::Write, .., |_| {});
+        }
+
+        sort.add_step(egui_encoder, *image_size, *threshold);
 
         Vec::new()
     }
@@ -237,7 +316,6 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
         callback_resources: &egui_wgpu::CallbackResources,
     ) {
         let ViewerResources {
-            image_size,
             render_bind_group,
             render_pipeline,
             ..
@@ -252,7 +330,7 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
             bytemuck::bytes_of(&ViewerImmediates {
                 viewport_top_left: [viewport.left_px as f32, viewport.top_px as f32],
                 viewport_size: [viewport.width_px as f32, viewport.height_px as f32],
-                image_size: *image_size,
+                image_size: self.viewer.image_size,
             }),
         );
         render_pass.draw(0..6, 0..1);
@@ -260,8 +338,8 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
 }
 
 struct ViewerResources {
-    image: wgpu::Buffer,
-    image_size: Vec2U32,
+    upload: wgpu::Buffer,
+    download: wgpu::Buffer,
     sort: PixelSort,
     render_bind_group: wgpu::BindGroup,
     render_pipeline: wgpu::RenderPipeline,
@@ -283,3 +361,64 @@ const REQUIRED_IMMEDIATE_SIZE: u32 = const_max_u32_slice(&[
 ]);
 const MAX_IMAGE_PIXELS: u64 = 7680 * 4320; // 8k
 const REQUIRED_STORAGE_BUFFER_BINDING_SIZE: u64 = MAX_IMAGE_PIXELS * U64_SIZE.get() * 2;
+
+fn read_image(path: &Path) -> (image::RgbaImage, Vec2U32) {
+    let img = image::ImageReader::open(path)
+        .unwrap()
+        .decode()
+        .unwrap()
+        .into_rgba8();
+    let image_size = Vec2U32 {
+        x: img.width(),
+        y: img.height(),
+    };
+
+    (img, image_size)
+}
+
+fn download_write_image(render_state: &egui_wgpu::RenderState, image_size: Vec2U32, path: &Path) {
+    let renderer = render_state.renderer.read();
+    let resources = renderer
+        .callback_resources
+        .get::<ViewerResources>()
+        .unwrap();
+
+    let mut encoder = render_state
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("download encoder"),
+        });
+    resources
+        .sort
+        .copy_from_output(&mut encoder, &resources.download, image_size);
+    let bounds = ..image_size.product() * U32_SIZE.get();
+    encoder.map_buffer_on_submit(&resources.download, wgpu::MapMode::Read, bounds, |_| {});
+    let ix = render_state.queue.submit([encoder.finish()]);
+    render_state
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(ix),
+            timeout: None,
+        })
+        .unwrap();
+
+    let downloaded = resources.download.get_mapped_range(bounds).unwrap();
+    let rgba = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(
+        image_size.x,
+        image_size.y,
+        &downloaded,
+    )
+    .unwrap();
+    let mut rgb = image::RgbImage::new(image_size.x, image_size.y);
+    rgb.copy_from_color_space(&rgba, image::ConvertColorOptions::default())
+        .unwrap();
+
+    image::save_buffer(
+        path,
+        &rgb,
+        image_size.x,
+        image_size.y,
+        image::ColorType::Rgb8,
+    )
+    .unwrap();
+}

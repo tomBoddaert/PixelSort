@@ -10,10 +10,12 @@ struct Immediates {
 var<immediate> immediates: Immediates;
 
 @group(0) @binding(0)
-var<storage, read_write> image: array<u32>;
+var<storage, read> image: array<u32>;
 @group(0) @binding(1)
 var<storage, read_write> tagged_image: array<vec2<u32>>;
 var<private> tagged_image_shift = 0u;
+@group(0) @binding(2)
+var<storage, read_write> output: array<u32>;
 
 @compute @workgroup_size(workgroup_size)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -215,7 +217,7 @@ fn write_image(id: u32, y_offset: u32) {
     let block_top = min(block_base + immediates.block_size, immediates.width);
     for (var i = block_base; i < block_top; i++) {
         let rgb = read_tagged(y_offset + i).y;
-        image[y_offset + i] = rgb;
+        output[y_offset + i] = rgb;
     }
 }
 
