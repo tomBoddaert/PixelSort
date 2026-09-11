@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    borrow::Borrow,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
@@ -265,19 +264,19 @@ struct ViewerCallback {
 impl egui_wgpu::CallbackTrait for ViewerCallback {
     fn prepare(
         &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
         egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let Viewer {
-            size,
             image_size,
             image,
             image_updated,
             threshold,
             threshold_updated,
+            ..
         } = &self.viewer;
         let threshold_update = threshold_updated.swap(false, std::sync::atomic::Ordering::AcqRel);
         let image_update = image_updated.swap(false, std::sync::atomic::Ordering::AcqRel);
