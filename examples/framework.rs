@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use pixel_sort::{U32_SIZE, Vec2U32, const_max_u32_slice, const_size_of_u32};
+use pixel_sort::{
+    Vec2U32,
+    utils::{U32_SIZE, const_max_u32_slice, const_size_of_u32},
+};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 

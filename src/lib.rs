@@ -1,25 +1,40 @@
-use std::num::NonZero;
-
-use crate::errors::{
-    CopyError, NewError, OversizedBufferError, OversizedImageError, OversizedImmediatesError,
-    SizeOverflowError,
+use crate::{
+    errors::{
+        CopyError, NewError, OversizedBufferError, OversizedImageError, OversizedImmediatesError,
+        SizeOverflowError,
+    },
+    utils::{U32_SIZE, U64_SIZE, const_size_of_u32},
 };
 
 pub mod errors;
+pub mod utils;
 
-pub const U32_SIZE: NonZero<u64> = NonZero::new(const_usize_to_u64(size_of::<u32>())).unwrap();
-pub const U64_SIZE: NonZero<u64> = NonZero::new(const_usize_to_u64(size_of::<u64>())).unwrap();
 pub const BIT_LEN: u32 = 4;
 pub const BASE: u32 = 2_u32.pow(BIT_LEN);
 pub const SHADER_MODULE_DESCRIPTOR: wgpu::ShaderModuleDescriptor =
     wgpu::include_wgsl!("pixel_sort.wgsl");
 const TAGGED_IMAGE_UNIT_SIZE: u64 = U64_SIZE.get() * 2;
+pub const REQUIRED_FEATURES: wgpu::Features = wgpu::Features::IMMEDIATES;
+pub const IMMEDIATES_SIZE: u32 = const_size_of_u32::<Immediates>();
 
-// TODO: replace this with a wgsl module to copy buffers without COPY_SRC for testing
 #[cfg(not(test))]
 const TEST_COPY_SRC: wgpu::BufferUsages = wgpu::BufferUsages::empty();
 #[cfg(test)]
 const TEST_COPY_SRC: wgpu::BufferUsages = wgpu::BufferUsages::COPY_SRC;
+
+#[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+pub struct Vec2U32 {
+    pub x: u32,
+    pub y: u32,
+}
+impl Vec2U32 {
+    #[must_use]
+    #[inline]
+    pub fn product(self) -> u64 {
+        u64::from(self.x) * u64::from(self.y)
+    }
+}
 
 pub struct PixelSort {
     pub max_pixels: u64,
@@ -38,6 +53,8 @@ impl PixelSort {
         max_pixels: u64,
     ) -> Result<Self, NewError> {
         let limits = device.limits();
+
+        // TODO: check device features
 
         if IMMEDIATES_SIZE > limits.max_immediate_size {
             return Err(OversizedImmediatesError {
@@ -228,80 +245,36 @@ pub struct Immediates {
     pub threshold: f32,
 }
 
-#[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-pub struct Vec2U32 {
-    pub x: u32,
-    pub y: u32,
-}
-impl Vec2U32 {
-    #[must_use]
-    #[inline]
-    pub fn product(self) -> u64 {
-        u64::from(self.x) * u64::from(self.y)
+#[inline]
+pub const fn required_buffer_size(max_pixels: u64) -> Result<u64, SizeOverflowError> {
+    if let Some(size) = max_pixels.checked_mul(TAGGED_IMAGE_UNIT_SIZE) {
+        Ok(size)
+    } else {
+        Err(SizeOverflowError { max_pixels })
     }
 }
+pub fn add_requred_features_and_limits(
+    mut device_descriptor: wgpu::DeviceDescriptor,
+    max_pixels: u64,
+) -> Result<wgpu::DeviceDescriptor, SizeOverflowError> {
+    let size = required_buffer_size(max_pixels)?;
 
-pub const IMMEDIATES_SIZE: u32 = const_size_of_u32::<Immediates>();
+    device_descriptor.required_features |= REQUIRED_FEATURES;
 
-pub const fn const_usize_to_u32(value: usize) -> u32 {
-    if size_of::<u32>() >= size_of::<usize>() {
-        return value as u32;
-    }
-    if value > u32::MAX as usize {
-        panic!();
-    }
-    value as u32
-}
-pub const fn const_usize_to_u64(value: usize) -> u64 {
-    if size_of::<u64>() >= size_of::<usize>() {
-        return value as u64;
-    }
-    if value > u64::MAX as usize {
-        panic!();
-    }
-    value as u64
-}
-pub const fn const_u32_to_usize(value: u32) -> usize {
-    if size_of::<usize>() >= size_of::<u32>() {
-        return value as usize;
-    }
-    if value > usize::MAX as u32 {
-        panic!();
-    }
-    value as usize
-}
-pub const fn const_u64_to_usize(value: u64) -> usize {
-    if size_of::<usize>() >= size_of::<u64>() {
-        return value as usize;
-    }
-    if value > usize::MAX as u64 {
-        panic!();
-    }
-    value as usize
-}
-pub const fn const_size_of_u32<T>() -> u32 {
-    const_usize_to_u32(size_of::<T>())
-}
-pub const fn const_size_of_u64<T>() -> u64 {
-    const_usize_to_u64(size_of::<T>())
-}
-pub const fn const_size_of_value_u64<T>(_: &T) -> u64 {
-    const_size_of_u64::<T>()
-}
-pub const fn const_max_u32_slice(s: &[u32]) -> u32 {
-    let mut max = 0;
-    let mut i = 0;
+    device_descriptor.required_limits.max_immediate_size = device_descriptor
+        .required_limits
+        .max_immediate_size
+        .max(IMMEDIATES_SIZE);
+    device_descriptor
+        .required_limits
+        .max_storage_buffer_binding_size = device_descriptor
+        .required_limits
+        .max_storage_buffer_binding_size
+        .max(size);
+    device_descriptor.required_limits.max_buffer_size =
+        device_descriptor.required_limits.max_buffer_size.max(size);
 
-    while i < s.len() {
-        if s[i] > max {
-            max = s[i];
-        }
-
-        i += 1;
-    }
-
-    max
+    Ok(device_descriptor)
 }
 
 #[cfg(test)]
@@ -312,8 +285,10 @@ mod test {
 
     use crate::{
         BASE, IMMEDIATES_SIZE, Immediates, PixelSort, SHADER_MODULE_DESCRIPTOR, Vec2U32,
-        const_size_of_u32, const_size_of_u64, const_size_of_value_u64, const_u32_to_usize,
-        const_u64_to_usize,
+        utils::{
+            const_size_of_u32, const_size_of_u64, const_size_of_value_u64, const_u32_to_usize,
+            const_u64_to_usize,
+        },
     };
 
     struct State {

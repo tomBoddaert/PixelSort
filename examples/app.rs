@@ -7,7 +7,10 @@ use std::{
 };
 
 use eframe::{egui, egui_wgpu};
-use pixel_sort::{PixelSort, U32_SIZE, U64_SIZE, Vec2U32, const_max_u32_slice, const_size_of_u32};
+use pixel_sort::{
+    PixelSort, Vec2U32, add_requred_features_and_limits,
+    utils::{U32_SIZE, const_max_u32_slice, const_size_of_u32},
+};
 
 fn main() -> eframe::Result {
     env_logger::init();
@@ -17,18 +20,14 @@ fn main() -> eframe::Result {
         egui_wgpu::WgpuSetup::CreateNew(wgpu_setup_create_new) => {
             let previous = Arc::clone(&wgpu_setup_create_new.device_descriptor);
             wgpu_setup_create_new.device_descriptor = Arc::new(move |adapter| {
-                let mut device_descriptor = previous(adapter);
+                let device_descriptor = previous(adapter);
+                let mut device_descriptor =
+                    add_requred_features_and_limits(device_descriptor, MAX_IMAGE_PIXELS).unwrap();
 
-                device_descriptor.required_features |= REQUIRED_FEATURES;
                 device_descriptor.required_limits.max_immediate_size = device_descriptor
                     .required_limits
                     .max_immediate_size
                     .max(REQUIRED_IMMEDIATE_SIZE);
-                device_descriptor
-                    .required_limits
-                    .max_storage_buffer_binding_size = REQUIRED_STORAGE_BUFFER_BINDING_SIZE;
-                device_descriptor.required_limits.max_buffer_size =
-                    REQUIRED_STORAGE_BUFFER_BINDING_SIZE;
 
                 device_descriptor
             })
@@ -351,14 +350,11 @@ struct ViewerImmediates {
     image_size: Vec2U32,
 }
 
-const REQUIRED_FEATURES: wgpu::Features =
-    wgpu::Features::IMMEDIATES.union(wgpu::Features::SUBGROUP);
 const REQUIRED_IMMEDIATE_SIZE: u32 = const_max_u32_slice(&[
     pixel_sort::IMMEDIATES_SIZE,
     const_size_of_u32::<ViewerImmediates>(),
 ]);
 const MAX_IMAGE_PIXELS: u64 = 7680 * 4320; // 8k
-const REQUIRED_STORAGE_BUFFER_BINDING_SIZE: u64 = MAX_IMAGE_PIXELS * U64_SIZE.get() * 2;
 
 fn read_image(path: &Path) -> (image::RgbaImage, Vec2U32) {
     let img = image::ImageReader::open(path)

@@ -1,4 +1,7 @@
-use pixel_sort::{U32_SIZE, U64_SIZE, Vec2U32};
+use pixel_sort::{
+    Vec2U32,
+    utils::{U32_SIZE, U64_SIZE},
+};
 
 mod framework;
 
