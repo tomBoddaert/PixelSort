@@ -32,7 +32,7 @@ impl framework::Example for PixelSort {
         wgpu::BindGroupLayout,
         wgpu::BindGroup,
     ) {
-        let ps = pixel_sort::PixelSort::new(device, workgroup_size, image_size.product());
+        let ps = pixel_sort::PixelSort::new(device, workgroup_size, image_size.product()).unwrap();
 
         let image_layout = wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -53,8 +53,8 @@ impl framework::Example for PixelSort {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        ps.copy_to_input(&mut encoder, &image, image_size);
-        ps.add_step(&mut encoder, image_size, THRESHOLD);
+        ps.copy_to_input(&mut encoder, &image, image_size).unwrap();
+        ps.add_step(&mut encoder, image_size, THRESHOLD).unwrap();
         let idx = queue.submit([encoder.finish()]);
         device
             .poll(wgpu::PollType::Wait {

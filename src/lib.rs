@@ -1,9 +1,19 @@
 use std::num::NonZero;
 
+use crate::errors::{
+    CopyError, NewError, OversizedBufferError, OversizedImageError, OversizedImmediatesError,
+    SizeOverflowError,
+};
+
+pub mod errors;
+
 pub const U32_SIZE: NonZero<u64> = NonZero::new(const_usize_to_u64(size_of::<u32>())).unwrap();
 pub const U64_SIZE: NonZero<u64> = NonZero::new(const_usize_to_u64(size_of::<u64>())).unwrap();
 pub const BIT_LEN: u32 = 4;
 pub const BASE: u32 = 2_u32.pow(BIT_LEN);
+pub const SHADER_MODULE_DESCRIPTOR: wgpu::ShaderModuleDescriptor =
+    wgpu::include_wgsl!("pixel_sort.wgsl");
+const TAGGED_IMAGE_UNIT_SIZE: u64 = U64_SIZE.get() * 2;
 
 // TODO: replace this with a wgsl module to copy buffers without COPY_SRC for testing
 #[cfg(not(test))]
@@ -22,12 +32,42 @@ pub struct PixelSort {
 }
 
 impl PixelSort {
-    pub fn new(device: &wgpu::Device, workgroup_size: u32, max_pixels: u64) -> Self {
-        let module = device.create_shader_module(wgpu::include_wgsl!("pixel_sort.wgsl"));
+    pub fn new(
+        device: &wgpu::Device,
+        workgroup_size: u32,
+        max_pixels: u64,
+    ) -> Result<Self, NewError> {
+        let limits = device.limits();
+
+        if IMMEDIATES_SIZE > limits.max_immediate_size {
+            return Err(OversizedImmediatesError {
+                max_immediate_size: limits.max_immediate_size,
+            }
+            .into());
+        }
+
+        // Largest buffer size needed
+        let tagged_image_size = max_pixels
+            .checked_mul(TAGGED_IMAGE_UNIT_SIZE)
+            .ok_or(SizeOverflowError { max_pixels })?;
+        if tagged_image_size
+            > limits
+                .max_buffer_size
+                .min(limits.max_storage_buffer_binding_size)
+        {
+            return Err(OversizedBufferError {
+                size: tagged_image_size,
+                max_buffer_size: limits.max_buffer_size,
+                max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+            }
+            .into());
+        }
+
+        let module = device.create_shader_module(SHADER_MODULE_DESCRIPTOR);
 
         let input = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("PixelSort::input"),
-            size: max_pixels.checked_mul(U32_SIZE.get()).unwrap(),
+            size: max_pixels * U32_SIZE.get(),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -48,7 +88,7 @@ impl PixelSort {
 
         let tagged_image = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("PixelSort::tagged_image"),
-            size: max_pixels.checked_mul(U64_SIZE.get() * 2).unwrap(),
+            size: tagged_image_size,
             usage: wgpu::BufferUsages::STORAGE | TEST_COPY_SRC,
             mapped_at_creation: false,
         });
@@ -116,7 +156,7 @@ impl PixelSort {
             cache: None,
         });
 
-        Self {
+        Ok(Self {
             max_pixels,
             input,
             tagged_image,
@@ -124,7 +164,7 @@ impl PixelSort {
             bind_group,
             pipeline,
             workgroup_size,
-        }
+        })
     }
 
     pub fn copy_to_input(
@@ -132,10 +172,10 @@ impl PixelSort {
         encoder: &mut wgpu::CommandEncoder,
         image: &wgpu::Buffer,
         image_size: Vec2U32,
-    ) {
-        let pixels = image_size.product();
-        assert!(pixels <= self.max_pixels);
-        encoder.copy_buffer_to_buffer(image, 0, &self.input, 0, pixels * U32_SIZE.get());
+    ) -> Result<(), CopyError> {
+        let size = CopyError::check(image_size, self.max_pixels, image.size())?;
+        encoder.copy_buffer_to_buffer(image, 0, &self.input, 0, size);
+        Ok(())
     }
 
     pub fn copy_from_output(
@@ -143,10 +183,10 @@ impl PixelSort {
         encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::Buffer,
         image_size: Vec2U32,
-    ) {
-        let pixels = image_size.product();
-        assert!(pixels <= self.max_pixels);
-        encoder.copy_buffer_to_buffer(&self.output, 0, output, 0, pixels * U32_SIZE.get());
+    ) -> Result<(), CopyError> {
+        let size = CopyError::check(image_size, self.max_pixels, output.size())?;
+        encoder.copy_buffer_to_buffer(&self.output, 0, output, 0, size);
+        Ok(())
     }
 
     pub fn add_step(
@@ -154,9 +194,8 @@ impl PixelSort {
         encoder: &mut wgpu::CommandEncoder,
         image_size: Vec2U32,
         threshold: f32,
-    ) {
-        let pixels = image_size.product();
-        assert!(pixels <= self.max_pixels);
+    ) -> Result<(), OversizedImageError> {
+        OversizedImageError::check(image_size, self.max_pixels)?;
 
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("PixelSort compute_pass"),
@@ -176,6 +215,8 @@ impl PixelSort {
         );
 
         compute_pass.dispatch_workgroups(1, image_size.y, 1);
+
+        Ok(())
     }
 }
 
@@ -270,8 +311,9 @@ mod test {
     use wgpu::util::DeviceExt;
 
     use crate::{
-        BASE, IMMEDIATES_SIZE, Immediates, PixelSort, Vec2U32, const_size_of_u32,
-        const_size_of_u64, const_size_of_value_u64, const_u32_to_usize, const_u64_to_usize,
+        BASE, IMMEDIATES_SIZE, Immediates, PixelSort, SHADER_MODULE_DESCRIPTOR, Vec2U32,
+        const_size_of_u32, const_size_of_u64, const_size_of_value_u64, const_u32_to_usize,
+        const_u64_to_usize,
     };
 
     struct State {
@@ -313,7 +355,7 @@ mod test {
                 }))
                 .expect("Failed to create device");
 
-            let module = device.create_shader_module(wgpu::include_wgsl!("pixel_sort.wgsl"));
+            let module = device.create_shader_module(SHADER_MODULE_DESCRIPTOR);
 
             State {
                 device,
@@ -1017,7 +1059,7 @@ mod test {
     fn full() {
         let State { device, queue, .. } = get_state();
 
-        let pixel_sort = PixelSort::new(device, WORKGROUP_SIZE, IMAGE_PIXELS);
+        let pixel_sort = PixelSort::new(device, WORKGROUP_SIZE, IMAGE_PIXELS).unwrap();
 
         let image = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
@@ -1037,8 +1079,12 @@ mod test {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        pixel_sort.copy_to_input(&mut encoder, &image, IMAGE_SIZE);
-        pixel_sort.add_step(&mut encoder, IMAGE_SIZE, THRESHOLD);
+        pixel_sort
+            .copy_to_input(&mut encoder, &image, IMAGE_SIZE)
+            .unwrap();
+        pixel_sort
+            .add_step(&mut encoder, IMAGE_SIZE, THRESHOLD)
+            .unwrap();
         encoder.copy_buffer_to_buffer(
             &pixel_sort.tagged_image,
             0,

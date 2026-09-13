@@ -33,11 +33,8 @@ fn main() -> eframe::Result {
                 device_descriptor
             })
         }
-        egui_wgpu::WgpuSetup::Existing(wgpu_setup_existing) => {
-            let device = &wgpu_setup_existing.device;
-
-            assert!(device.features().contains(REQUIRED_FEATURES));
-            assert!(device.limits().max_immediate_size >= REQUIRED_IMMEDIATE_SIZE);
+        egui_wgpu::WgpuSetup::Existing(_wgpu_setup_existing) => {
+            unreachable!()
         }
     }
 
@@ -80,7 +77,7 @@ impl App {
 
         let workgroup_size = wgpu_render_state.adapter.get_info().subgroup_max_size;
 
-        let sort = PixelSort::new(device, workgroup_size, MAX_IMAGE_PIXELS);
+        let sort = PixelSort::new(device, workgroup_size, MAX_IMAGE_PIXELS).unwrap();
 
         let render_module = device.create_shader_module(wgpu::include_wgsl!("app_viewer.wgsl"));
 
@@ -299,11 +296,13 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
             drop(mapped);
             upload.unmap();
 
-            sort.copy_to_input(egui_encoder, upload, *image_size);
+            sort.copy_to_input(egui_encoder, upload, *image_size)
+                .unwrap();
             egui_encoder.map_buffer_on_submit(upload, wgpu::MapMode::Write, .., |_| {});
         }
 
-        sort.add_step(egui_encoder, *image_size, *threshold);
+        sort.add_step(egui_encoder, *image_size, *threshold)
+            .unwrap();
 
         Vec::new()
     }
@@ -389,7 +388,8 @@ fn download_write_image(render_state: &egui_wgpu::RenderState, image_size: Vec2U
         });
     resources
         .sort
-        .copy_from_output(&mut encoder, &resources.download, image_size);
+        .copy_from_output(&mut encoder, &resources.download, image_size)
+        .unwrap();
     let bounds = ..image_size.product() * U32_SIZE.get();
     encoder.map_buffer_on_submit(&resources.download, wgpu::MapMode::Read, bounds, |_| {});
     let ix = render_state.queue.submit([encoder.finish()]);
