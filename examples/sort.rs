@@ -1,7 +1,8 @@
 use pixel_sort::{
-    Vec2U32,
+    Config, ConfigBuffer, Vec2U32,
     utils::{U32_SIZE, U64_SIZE},
 };
+use wgpu::util::DeviceExt;
 
 mod framework;
 
@@ -52,12 +53,25 @@ impl framework::Example for PixelSort {
             resource: ps.output.as_entire_binding(),
         };
 
-        const THRESHOLD: f32 = 0.4;
+        const CONFIG: Config = {
+            let mut buf = ConfigBuffer::new();
+            assert!(buf.push_sorted(0, true).is_ok());
+            assert!(buf.push_sorted((0.4 * 255.) as u8, false).is_ok());
+            assert!(buf.push_sorted((0.6 * 255.) as u8, true).is_ok());
+            assert!(buf.push_sorted((0.75 * 255.) as u8, true).is_ok());
+            buf.finish()
+        };
+        let config_upload = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&CONFIG),
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+        });
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         ps.copy_to_input(&mut encoder, &image, image_size).unwrap();
-        ps.add_step(&mut encoder, image_size, THRESHOLD).unwrap();
+        ps.copy_to_config(&mut encoder, &config_upload).unwrap();
+        ps.add_step(&mut encoder, image_size).unwrap();
         let idx = queue.submit([encoder.finish()]);
         device
             .poll(wgpu::PollType::Wait {

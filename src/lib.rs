@@ -3,11 +3,13 @@ use crate::{
         CopyError, NewError, OversizedBufferError, OversizedImageError, OversizedImmediatesError,
         SizeOverflowError,
     },
-    utils::{U32_SIZE, U64_SIZE, const_size_of_u32},
+    utils::{U32_SIZE, U64_SIZE, const_size_of_u32, const_size_of_u64},
 };
 
+mod config;
 pub mod errors;
 pub mod utils;
+pub use config::*;
 
 pub const BIT_LEN: u32 = 4;
 pub const BASE: u32 = 2_u32.pow(BIT_LEN);
@@ -21,6 +23,27 @@ pub const IMMEDIATES_SIZE: u32 = const_size_of_u32::<Immediates>();
 const TEST_COPY_SRC: wgpu::BufferUsages = wgpu::BufferUsages::empty();
 #[cfg(test)]
 const TEST_COPY_SRC: wgpu::BufferUsages = wgpu::BufferUsages::COPY_SRC;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Binding {
+    Image = 0,
+    Config = 1,
+    TaggedImage = 2,
+    Output = 3,
+}
+impl Binding {
+    #[inline]
+    pub const fn get(self) -> u32 {
+        self as u32
+    }
+}
+impl From<Binding> for u32 {
+    #[inline]
+    fn from(value: Binding) -> Self {
+        value.get()
+    }
+}
 
 #[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
@@ -39,6 +62,7 @@ impl Vec2U32 {
 pub struct PixelSort {
     pub max_pixels: u64,
     pub input: wgpu::Buffer,
+    pub config: wgpu::Buffer,
     pub tagged_image: wgpu::Buffer,
     pub output: wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
@@ -89,7 +113,7 @@ impl PixelSort {
             mapped_at_creation: false,
         });
         let input_layout = wgpu::BindGroupLayoutEntry {
-            binding: 0,
+            binding: Binding::Image.get(),
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -103,6 +127,27 @@ impl PixelSort {
             resource: input.as_entire_binding(),
         };
 
+        let config = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("PixelSort::config"),
+            size: const { const_size_of_u64::<Config>() },
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let config_layout = wgpu::BindGroupLayoutEntry {
+            binding: Binding::Config.get(),
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: Some(CONFIG_SIZE),
+            },
+            count: None,
+        };
+        let config_entry = wgpu::BindGroupEntry {
+            binding: config_layout.binding,
+            resource: config.as_entire_binding(),
+        };
+
         let tagged_image = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("PixelSort::tagged_image"),
             size: tagged_image_size,
@@ -110,7 +155,7 @@ impl PixelSort {
             mapped_at_creation: false,
         });
         let tagged_image_layout = wgpu::BindGroupLayoutEntry {
-            binding: 1,
+            binding: Binding::TaggedImage.get(),
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -131,7 +176,7 @@ impl PixelSort {
             mapped_at_creation: false,
         });
         let output_layout = wgpu::BindGroupLayoutEntry {
-            binding: 2,
+            binding: Binding::Output.get(),
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -147,12 +192,17 @@ impl PixelSort {
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("PixelSort bind_group_layout"),
-            entries: &[input_layout, tagged_image_layout, output_layout],
+            entries: &[
+                input_layout,
+                config_layout,
+                tagged_image_layout,
+                output_layout,
+            ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("PixelSort::bind_group"),
             layout: &bind_group_layout,
-            entries: &[input_entry, tagged_image_entry, output_entry],
+            entries: &[input_entry, config_entry, tagged_image_entry, output_entry],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -176,6 +226,7 @@ impl PixelSort {
         Ok(Self {
             max_pixels,
             input,
+            config,
             tagged_image,
             output,
             bind_group,
@@ -195,6 +246,18 @@ impl PixelSort {
         Ok(())
     }
 
+    pub fn copy_to_config(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        config: &wgpu::Buffer,
+    ) -> Result<(), ()> {
+        if config.size() < CONFIG_SIZE.get() {
+            return Err(());
+        }
+        encoder.copy_buffer_to_buffer(config, 0, &self.config, 0, CONFIG_SIZE.get());
+        Ok(())
+    }
+
     pub fn copy_from_output(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -210,7 +273,6 @@ impl PixelSort {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         image_size: Vec2U32,
-        threshold: f32,
     ) -> Result<(), OversizedImageError> {
         OversizedImageError::check(image_size, self.max_pixels)?;
 
@@ -227,7 +289,6 @@ impl PixelSort {
             bytemuck::bytes_of(&Immediates {
                 width: image_size.x,
                 block_size,
-                threshold,
             }),
         );
 
@@ -242,7 +303,6 @@ impl PixelSort {
 pub struct Immediates {
     pub width: u32,
     pub block_size: u32,
-    pub threshold: f32,
 }
 
 #[inline]
@@ -284,7 +344,8 @@ mod test {
     use wgpu::util::DeviceExt;
 
     use crate::{
-        BASE, IMMEDIATES_SIZE, Immediates, PixelSort, SHADER_MODULE_DESCRIPTOR, Vec2U32,
+        BASE, Binding, CONFIG_SIZE, Config, ConfigBuffer, IMMEDIATES_SIZE, Immediates, PixelSort,
+        SHADER_MODULE_DESCRIPTOR, Vec2U32,
         utils::{
             const_size_of_u32, const_size_of_u64, const_size_of_value_u64, const_u32_to_usize,
             const_u64_to_usize,
@@ -376,7 +437,7 @@ mod test {
 
         image
     };
-    const THRESHOLD: f32 = 0.5;
+    const CONFIG: Config = ConfigBuffer::single_sorted(true, 128, true).finish();
     const BLOCK_SIZE: u32 = IMAGE_SIZE.x.div_ceil(WORKGROUP_SIZE);
     const THRESHOLDED: [[bool; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = [
         [false; IMAGE_WIDTH_USIZE],
@@ -656,6 +717,7 @@ mod test {
     struct Instance {
         state: &'static State,
         input: Buffer,
+        config: Buffer,
         tagged_image: Buffer,
         output: Buffer,
         bind_group: wgpu::BindGroup,
@@ -717,18 +779,59 @@ mod test {
             test_buffer,
         };
 
-        let input = Buffer::create(options.input, device, "input", 0, true);
-        let tagged_image = Buffer::create(options.tagged_image, device, "tagged_image", 1, false);
-        let output = Buffer::create(options.input, device, "output", 2, false);
+        let input = Buffer::create(options.input, device, "input", Binding::Image.get(), true);
+        let config = {
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("config"),
+                contents: bytemuck::bytes_of(&CONFIG),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let layout = wgpu::BindGroupLayoutEntry {
+                binding: Binding::Config.get(),
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: Some(CONFIG_SIZE),
+                },
+                count: None,
+            };
+
+            Buffer { buffer, layout }
+        };
+        let tagged_image = Buffer::create(
+            options.tagged_image,
+            device,
+            "tagged_image",
+            Binding::TaggedImage.get(),
+            false,
+        );
+        let output = Buffer::create(
+            options.input,
+            device,
+            "output",
+            Binding::Output.get(),
+            false,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bind_group_layout"),
-            entries: &[input.layout, tagged_image.layout, output.layout],
+            entries: &[
+                input.layout,
+                tagged_image.layout,
+                config.layout,
+                output.layout,
+            ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bind_group"),
             layout: &bind_group_layout,
-            entries: &[input.entry(), tagged_image.entry(), output.entry()],
+            entries: &[
+                input.entry(),
+                tagged_image.entry(),
+                config.entry(),
+                output.entry(),
+            ],
         });
 
         let test_buffer = Buffer::create(options.test_buffer, device, "test_buffer", 0, false);
@@ -777,6 +880,7 @@ mod test {
         Instance {
             state,
             input,
+            config,
             tagged_image,
             output,
             bind_group,
@@ -808,7 +912,6 @@ mod test {
                 bytemuck::bytes_of(&Immediates {
                     width: IMAGE_SIZE.x,
                     block_size: BLOCK_SIZE,
-                    threshold: THRESHOLD,
                 }),
             );
             compute_pass.dispatch_workgroups(1, IMAGE_SIZE.y, 1);
@@ -1041,6 +1144,11 @@ mod test {
             contents: bytemuck::cast_slice(&IMAGE),
             usage: wgpu::BufferUsages::COPY_SRC,
         });
+        let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&CONFIG),
+            usage: image.usage(),
+        });
         let download = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: pixel_sort
@@ -1057,9 +1165,8 @@ mod test {
         pixel_sort
             .copy_to_input(&mut encoder, &image, IMAGE_SIZE)
             .unwrap();
-        pixel_sort
-            .add_step(&mut encoder, IMAGE_SIZE, THRESHOLD)
-            .unwrap();
+        pixel_sort.copy_to_config(&mut encoder, &config).unwrap();
+        pixel_sort.add_step(&mut encoder, IMAGE_SIZE).unwrap();
         encoder.copy_buffer_to_buffer(
             &pixel_sort.tagged_image,
             0,

@@ -8,7 +8,7 @@ use std::{
 
 use eframe::{egui, egui_wgpu};
 use pixel_sort::{
-    PixelSort, Vec2U32, add_requred_features_and_limits,
+    CONFIG_SIZE, Config, ConfigBuffer, PixelSort, Vec2U32, add_requred_features_and_limits,
     utils::{U32_SIZE, const_max_u32_slice, const_size_of_u32},
 };
 
@@ -61,15 +61,21 @@ impl App {
         let current_image = std::path::absolute("examples/source.jpg").unwrap();
         let (img, image_size) = read_image(&current_image);
 
-        let upload = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("upload"),
+        let image_upload = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image_upload"),
             size: const { MAX_IMAGE_PIXELS * U32_SIZE.get() },
             usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: true,
         });
+        let config_upload = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("config_upload"),
+            size: CONFIG_SIZE.get(),
+            usage: image_upload.usage(),
+            mapped_at_creation: true,
+        });
         let download = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("download"),
-            size: upload.size(),
+            size: image_upload.size(),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -139,7 +145,8 @@ impl App {
             .write()
             .callback_resources
             .insert(ViewerResources {
-                upload,
+                image_upload,
+                config_upload,
                 download,
                 sort,
                 render_bind_group,
@@ -215,15 +222,20 @@ impl eframe::App for App {
 
                 if let Some(initial_image) = self.initial_image.take() {
                     image_update = Some(image_update.unwrap_or(initial_image));
+                    threshold_updated = true;
                 }
+
+                let config = threshold_updated.then(|| {
+                    ConfigBuffer::single_sorted(true, (self.threshold * 255.) as u8, true).finish()
+                });
 
                 ui.add(Viewer {
                     size: ui.available_size(),
                     image_size: self.image_size,
                     image_updated: AtomicBool::new(image_update.is_some()),
                     image: image_update,
-                    threshold: self.threshold,
-                    threshold_updated: AtomicBool::new(threshold_updated),
+                    config,
+                    config_updated: AtomicBool::new(config.is_some()),
                 });
             })
         });
@@ -235,8 +247,8 @@ struct Viewer {
     image_size: Vec2U32,
     image: Option<image::RgbaImage>,
     image_updated: AtomicBool,
-    threshold: f32,
-    threshold_updated: AtomicBool,
+    config: Option<Config>,
+    config_updated: AtomicBool,
 }
 
 impl egui::Widget for Viewer {
@@ -260,7 +272,7 @@ struct ViewerCallback {
 impl egui_wgpu::CallbackTrait for ViewerCallback {
     fn prepare(
         &self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         _queue: &wgpu::Queue,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
         egui_encoder: &mut wgpu::CommandEncoder,
@@ -270,18 +282,22 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
             image_size,
             image,
             image_updated,
-            threshold,
-            threshold_updated,
+            config,
+            config_updated,
             ..
         } = &self.viewer;
-        let threshold_update = threshold_updated.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let config_update = config_updated.swap(false, std::sync::atomic::Ordering::AcqRel);
         let image_update = image_updated.swap(false, std::sync::atomic::Ordering::AcqRel);
-        if !(threshold_update || image_update) {
+        if !(config_update || image_update) {
             return Vec::new();
         }
 
-        let ViewerResources { upload, sort, .. } =
-            callback_resources.get::<ViewerResources>().unwrap();
+        let ViewerResources {
+            image_upload,
+            config_upload,
+            sort,
+            ..
+        } = callback_resources.get::<ViewerResources>().unwrap();
 
         if image_update && let Some(image) = image {
             let image_byte_len = Vec2U32 {
@@ -290,18 +306,29 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
             }
             .product()
                 * U32_SIZE.get();
-            let mut mapped = upload.get_mapped_range_mut(..image_byte_len).unwrap();
+            let mut mapped = image_upload.get_mapped_range_mut(..image_byte_len).unwrap();
             mapped.copy_from_slice(bytemuck::cast_slice(image));
             drop(mapped);
-            upload.unmap();
+            image_upload.unmap();
 
-            sort.copy_to_input(egui_encoder, upload, *image_size)
+            sort.copy_to_input(egui_encoder, image_upload, *image_size)
                 .unwrap();
-            egui_encoder.map_buffer_on_submit(upload, wgpu::MapMode::Write, .., |_| {});
+            egui_encoder.map_buffer_on_submit(image_upload, wgpu::MapMode::Write, .., |_| {});
         }
 
-        sort.add_step(egui_encoder, *image_size, *threshold)
-            .unwrap();
+        if config_update && let Some(config) = config {
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+            let mut mapped = config_upload.get_mapped_range_mut(..).unwrap();
+            mapped.copy_from_slice(bytemuck::bytes_of(config));
+            drop(mapped);
+            config_upload.unmap();
+
+            sort.copy_to_config(egui_encoder, config_upload).unwrap();
+            egui_encoder.map_buffer_on_submit(config_upload, wgpu::MapMode::Write, .., |_| {});
+        }
+
+        sort.add_step(egui_encoder, *image_size).unwrap();
 
         Vec::new()
     }
@@ -335,7 +362,8 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
 }
 
 struct ViewerResources {
-    upload: wgpu::Buffer,
+    image_upload: wgpu::Buffer,
+    config_upload: wgpu::Buffer,
     download: wgpu::Buffer,
     sort: PixelSort,
     render_bind_group: wgpu::BindGroup,

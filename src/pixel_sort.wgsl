@@ -5,16 +5,24 @@ override workgroup_size: u32;
 struct Immediates {
     width: u32,
     block_size: u32,
-    threshold: f32,
 }
 var<immediate> immediates: Immediates;
+
+struct Config {
+    len: u32,
+    // Must be vec4<u32> to have stride of 16 bytes (required for uniform arrays)
+    boundaries: array<vec4<u32>, 2>,
+    sort: u32,
+}
 
 @group(0) @binding(0)
 var<storage, read> image: array<u32>;
 @group(0) @binding(1)
+var<uniform> config: Config;
+@group(0) @binding(2)
 var<storage, read_write> tagged_image: array<vec2<u32>>;
 var<private> tagged_image_shift = 0u;
-@group(0) @binding(2)
+@group(0) @binding(3)
 var<storage, read_write> output: array<u32>;
 
 @compute @workgroup_size(workgroup_size)
@@ -43,11 +51,11 @@ fn count_changes(id: u32, y_offset: u32) -> u32 {
     let block_top = block_base + immediates.block_size + 1u;
 
     var change_count = 0u;
-    var previous = source_thresholded(y_offset + block_base);
+    var previous = source_boundary_id(y_offset + block_base);
 
     for (var i = block_base + 1u; i < block_top; i++) {
-        let current = source_thresholded(y_offset + i);
-        change_count += u32(previous != current);
+        let current = source_boundary_id(y_offset + i);
+        change_count += u32(previous != current || !is_sorted(current));
         previous = current;
     }
 
@@ -89,19 +97,18 @@ fn label_regions(
     let block_top = min(block_base + immediates.block_size, immediates.width);
 
     var change_count = offset;
-    var previous: bool;
 
     let rgb = image[y_offset + block_base];
     let value = get_value(rgb);
     write_tagged(y_offset + block_base, rgb, change_count, value);
 
-    previous = value > immediates.threshold;
+    var previous = find_boundary_id(value);
 
     for (var i = block_base + 1u; i < block_top; i++) {
         let rgb = image[y_offset + i];
         let value = get_value(rgb);
-        let current = value > immediates.threshold;
-        change_count += u32(current != previous);
+        let current = find_boundary_id(value);
+        change_count += u32(current != previous || !is_sorted(current));
         write_tagged(y_offset + i, rgb, change_count, value);
 
         previous = current;
@@ -230,11 +237,34 @@ fn get_value(rgb: u32) -> f32 {
     let sqrt_mean = (sqrt.x + sqrt.y + sqrt.z) / 3f;
     return sqrt_mean * sqrt_mean;
 }
-fn get_thresholded(rgb: u32) -> bool {
-    return get_value(rgb) > immediates.threshold;
+fn find_boundary_id(value: f32) -> u32 {
+    var i = 0u;
+    var boundaries4x4: vec4<u32>;
+    var boundaries4: vec4<f32>;
+
+    for (; i < config.len; i++) {
+        if (i % 16u == 0) {
+            boundaries4x4 = config.boundaries[i / 16u];
+        }
+        if (i % 4u == 0) {
+            boundaries4 = unpack4x8unorm(boundaries4x4[(i % 16u) / 4u]);
+        }
+
+        if (boundaries4[i % 4u] > value) {
+            break;
+        }
+    }
+
+    return i;
 }
-fn source_thresholded(index: u32) -> bool {
-    return get_thresholded(image[index]);
+fn get_boundary_id(rgb: u32) -> u32 {
+    return find_boundary_id(get_value(rgb));
+}
+fn source_boundary_id(index: u32) -> u32 {
+    return get_boundary_id(image[index]);
+}
+fn is_sorted(boundary_id: u32) -> bool {
+    return (config.sort & (1u << boundary_id)) != 0u;
 }
 
 fn write_tagged(

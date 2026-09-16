@@ -2,6 +2,8 @@ use std::{error, fmt};
 
 use crate::{IMMEDIATES_SIZE, TAGGED_IMAGE_UNIT_SIZE, U32_SIZE, Vec2U32};
 
+pub use crate::config::errors::*;
+
 #[derive(Clone, Copy)]
 pub struct OversizedImmediatesError {
     pub(crate) max_immediate_size: u32,
@@ -13,7 +15,7 @@ impl OversizedImmediatesError {
     }
 
     #[inline]
-    pub fn requested_immediate_size(&self) -> u32 {
+    pub fn required_immediate_size(&self) -> u32 {
         IMMEDIATES_SIZE
     }
 }
@@ -29,7 +31,7 @@ impl fmt::Debug for OversizedImmediatesError {
                 }),
             )
             .field(
-                "requested",
+                "required",
                 &fmt::from_fn(|fmt| {
                     fmt.debug_struct("")
                         .field("immediate_size", &IMMEDIATES_SIZE)
@@ -164,7 +166,7 @@ pub enum NewError {
     OversizedBuffer(OversizedBufferError),
 }
 impl NewError {
-    pub fn source(&self) -> &(dyn error::Error + 'static) {
+    pub const fn source(&self) -> &(dyn error::Error + 'static) {
         match self {
             NewError::OversizedImmediates(err) => err,
             NewError::SizeOverflow(err) => err,
@@ -357,7 +359,7 @@ pub enum CopyError {
     UndersizedBuffer(UndersizedBufferError),
 }
 impl CopyError {
-    pub fn source(&self) -> &(dyn error::Error + 'static) {
+    pub const fn source(&self) -> &(dyn error::Error + 'static) {
         match self {
             CopyError::OversizedImage(err) => err,
             CopyError::UndersizedBuffer(err) => err,
