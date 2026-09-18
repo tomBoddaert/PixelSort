@@ -1,7 +1,8 @@
 use std::num::NonZero;
 
 use pixel_sort::{
-    Config, ConfigBuffer, Vec2U32,
+    Vec2U32,
+    config::{self, Config},
     utils::{U32_SIZE, U64_SIZE},
 };
 use wgpu::util::DeviceExt;
@@ -61,13 +62,18 @@ impl framework::Example for PixelSort {
         };
 
         const CONFIGS: [Config; 2] = {
-            let mut buf1 = ConfigBuffer::new();
-            assert!(buf1.push_sorted(0, true).is_ok());
-            assert!(buf1.push_sorted((0.4 * 255.) as u8, false).is_ok());
+            let mut buf1 = config::ConfigBuffer::new();
+            assert!(buf1.push_sorted(0, config::Sort::Increasing).is_ok());
+            assert!(
+                buf1.push_sorted((0.35 * 255.) as u8, config::Sort::None)
+                    .is_ok()
+            );
 
-            let mut buf2 = ConfigBuffer::new();
-            assert!(buf2.push_sorted((0.4 * 255.) as u8, true).is_ok());
-            assert!(buf2.push_sorted((0.7 * 255.) as u8, false).is_ok());
+            let mut buf2 = config::ConfigBuffer::new();
+            assert!(
+                buf2.push_sorted((0.77 * 255.) as u8, config::Sort::Decreasing)
+                    .is_ok()
+            );
 
             [buf1.finish(), buf2.finish()]
         };

@@ -1,15 +1,32 @@
-use std::num::NonZero;
+use std::{mem, num::NonZero};
 
 use crate::{
-    errors::{AtCapacityError, EmptyError, NotFoundError, OutOfOrderError, PushSortedError},
+    config::errors::{AtCapacityError, NotFoundError, OutOfOrderError, PushSortedError},
     utils::const_size_of_u64,
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Sort {
+    #[default]
+    None = 0b00,
+    Increasing = 0b10,
+    Decreasing = 0b11,
+}
+impl Sort {
+    pub const DEFAULT: Self = Self::None;
+
+    #[inline]
+    pub const fn get(self) -> u32 {
+        self as u8 as u32
+    }
+}
+
+// TODO: default
+#[derive(Clone)]
 pub struct ConfigBuffer {
-    len: u8,
-    boundaries: [u8; ConfigBuffer::CAPACITY + 1],
-    sort: u32,
+    len: NonZero<u8>,
+    boundaries: [(u8, Sort); ConfigBuffer::CAPACITY + 1],
 }
 
 // TODO:
@@ -19,190 +36,157 @@ pub struct ConfigBuffer {
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
 pub struct Config {
-    pub len: u32,
-    pub _padding1: [u32; 3],
     pub boundaries: [u8; ConfigBuffer::CAPACITY + 1],
     pub sort: u32,
-    pub _padding2: [u32; 3],
+    pub _padding: [u32; 3],
 }
 
 pub const CONFIG_SIZE: NonZero<u64> = NonZero::new(const_size_of_u64::<Config>()).unwrap();
+const ONE: NonZero<u8> = NonZero::new(1).unwrap();
 
 impl ConfigBuffer {
-    pub const CAPACITY_U8: u8 = 32 - 1;
+    pub const CAPACITY_U8: u8 = 16 - 1;
     pub const CAPACITY: usize = Self::CAPACITY_U8 as usize;
 
     #[inline]
     pub const fn new() -> Self {
         Self {
-            len: 0,
-            boundaries: [0; Self::CAPACITY + 1],
-            sort: 0,
+            len: ONE,
+            boundaries: [(0, Sort::DEFAULT); Self::CAPACITY + 1],
         }
     }
 
     #[inline]
-    pub const fn len(&self) -> u8 {
+    pub const fn len(&self) -> NonZero<u8> {
         self.len
     }
 
     #[inline]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline]
     pub const fn finish(&self) -> Config {
+        let mut boundaries = [0; Self::CAPACITY + 1];
+        let mut sort = 0;
+
+        let mut i = 0;
+        while i < self.len.get() {
+            let (key, value) = self.boundaries[i as usize];
+
+            if let Some(j) = i.checked_sub(1) {
+                assert!(key != 0);
+                boundaries[j as usize] = key;
+            }
+            sort |= value.get() << (i * 2);
+
+            i += 1;
+        }
+
         Config {
-            len: self.len as u32,
-            _padding1: [0; 3],
-            boundaries: self.boundaries,
-            sort: self.sort,
-            _padding2: [0; 3],
+            boundaries,
+            sort,
+            _padding: [0; 3],
         }
     }
 
     #[inline]
     pub const fn clear(&mut self) {
-        self.len = 0;
+        self.boundaries[0] = (0, Sort::None);
+        self.len = ONE;
     }
 
     #[inline]
-    pub fn boundaries(&self) -> &[u8] {
-        &self.boundaries[..self.len.into()]
+    pub fn boundaries(&self) -> &[(u8, Sort)] {
+        &self.boundaries[..self.len.get().into()]
     }
 
-    #[inline]
-    const fn set_sort(&mut self, i: u8, sort: bool) {
-        let mask = !(1 << i);
-        let flag = (sort as u32) << i;
-        self.sort = (self.sort & mask) | flag;
-    }
-
-    #[inline]
-    const fn get_sort(&self, i: u8) -> bool {
-        let mask = 1 << i;
-        self.sort & mask != 0
-    }
-
-    pub const fn push_sorted(&mut self, boundary: u8, sort: bool) -> Result<(), PushSortedError> {
-        if boundary == 0 {
-            self.set_sort(0, sort);
-            return Ok(());
-        }
-
-        let (i, new) = if let Some(last_i) = self.len.checked_sub(1) {
-            let last = self.boundaries[last_i as usize];
-            if boundary > last {
-                if self.len == Self::CAPACITY_U8 {
-                    return Err(PushSortedError::AtCapacity(AtCapacityError {}));
-                }
-                (self.len, true)
-            } else if boundary == last {
-                (last_i, false)
-            } else {
-                return Err(PushSortedError::OutOfOrder(OutOfOrderError {
-                    last_boundary: last,
-                    boundary,
-                }));
+    pub const fn push_sorted(&mut self, boundary: u8, sort: Sort) -> Result<(), PushSortedError> {
+        let last_i = self.len.get() - 1;
+        let last = self.boundaries[last_i as usize].0;
+        let i = if boundary > last {
+            if self.len.get() >= Self::CAPACITY_U8 {
+                return Err(PushSortedError::AtCapacity(AtCapacityError {}));
             }
+
+            let new_len = self.len.saturating_add(1);
+            mem::replace(&mut self.len, new_len).get()
+        } else if boundary == last {
+            last_i
         } else {
-            (0, true)
+            return Err(PushSortedError::OutOfOrder(OutOfOrderError {
+                last_boundary: last,
+                boundary,
+            }));
         };
 
-        if new {
-            self.boundaries[i as usize] = boundary;
-            self.len += 1;
-        }
-        self.set_sort(i + 1, sort);
+        self.boundaries[i as usize] = (boundary, sort);
 
         Ok(())
     }
 
-    pub const fn pop_highest(&mut self) -> Result<(u8, bool), EmptyError> {
-        let i = match self.len.checked_sub(1) {
-            Some(i) => i,
-            None => return Err(EmptyError {}),
+    pub const fn pop_highest(&mut self) -> (u8, Sort) {
+        let Some(i) = NonZero::new(self.len.get() - 1) else {
+            return mem::replace(&mut self.boundaries[0], (0, Sort::DEFAULT));
         };
-
-        let boundary = self.boundaries[i as usize];
-        let sort = self.get_sort(i + 1);
-
         self.len = i;
-        Ok((boundary, sort))
+
+        self.boundaries[i.get() as usize]
     }
 
-    pub fn insert(&mut self, boundary: u8, sort: bool) -> Result<(), AtCapacityError> {
-        if boundary == 0 {
-            self.set_sort(0, sort);
-            return Ok(());
-        }
-
-        let i = match self.boundaries().binary_search(&boundary) {
-            Ok(i) => i as u8,
-            Err(i) => {
-                if self.len >= Self::CAPACITY_U8 {
-                    return Err(AtCapacityError {});
+    pub fn insert(&mut self, boundary: u8, sort: Sort) -> Result<(), AtCapacityError> {
+        let i = self
+            .boundaries()
+            .binary_search_by_key(&boundary, |(key, _value)| *key)
+            .or_else(|i| {
+                if self.len.get() >= Self::CAPACITY_U8 {
+                    Err(AtCapacityError {})
+                } else {
+                    self.boundaries.copy_within(i..self.len.get().into(), i + 1);
+                    self.len = self.len.saturating_add(1);
+                    Ok(i)
                 }
+            })?;
 
-                self.boundaries.copy_within(i..self.len.into(), i + 1);
-                self.boundaries[i] = boundary;
-
-                let i = i as u8;
-
-                let lower_mask = (1 << (i + 1)) - 1;
-                self.sort = (self.sort & !lower_mask) << 1 | (self.sort & lower_mask);
-
-                i
-            }
-        };
-
-        self.set_sort(i + 1, sort);
+        self.boundaries[i] = (boundary, sort);
 
         Ok(())
     }
 
-    pub fn is_sorted(self, boundary: u8) -> Result<bool, NotFoundError> {
-        let i = match self.boundaries().binary_search(&boundary) {
-            Ok(i) => i,
-            Err(_) => return Err(NotFoundError { boundary }),
-        };
-
-        Ok(self.get_sort(i as u8 + 1))
+    pub fn get(self, boundary: u8) -> Result<Sort, NotFoundError> {
+        self.boundaries()
+            .binary_search_by_key(&boundary, |(key, _value)| *key)
+            .map(|i| self.boundaries[i].1)
+            .map_err(|_| NotFoundError { boundary })
     }
 
-    pub fn remove(&mut self, boundary: u8) -> Result<bool, NotFoundError> {
-        let i = match self.boundaries().binary_search(&boundary) {
-            Ok(i) => i,
-            Err(_) => return Err(NotFoundError { boundary }),
-        };
+    pub fn remove(&mut self, boundary: u8) -> Result<Sort, NotFoundError> {
+        if boundary == 0 {
+            let (_, value) = mem::replace(&mut self.boundaries[0], (0, Sort::DEFAULT));
+            return Ok(value);
+        }
 
-        let sort = self.get_sort(i as u8 + 1);
+        let i = self
+            .boundaries()
+            .binary_search_by_key(&boundary, |(key, _value)| *key)
+            .map_err(|_| NotFoundError { boundary })?;
 
-        self.boundaries.copy_within((i + 1)..self.len.into(), i);
-
-        let lower_mask = (1 << (i + 1)) - 1;
-        self.sort = (self.sort & (!lower_mask << 1)) >> 1 | (self.sort & lower_mask);
+        let (_, sort) = self.boundaries[i];
+        self.boundaries
+            .copy_within((i + 1)..self.len.get().into(), i);
 
         Ok(sort)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (u8, bool)> {
-        std::iter::once(0).chain(1..=self.len).map(|i| {
-            (
-                i.checked_sub(1)
-                    .map_or(0, |j| self.boundaries[usize::from(j)]),
-                self.get_sort(i),
-            )
-        })
-    }
-
     #[inline]
-    pub const fn single_sorted(before: bool, boundary: u8, after: bool) -> Self {
+    pub const fn single_sorted(before: Sort, boundary: u8, after: Sort) -> Self {
         let mut config = Self::new();
         debug_assert!(config.push_sorted(0, before).is_ok());
         debug_assert!(config.push_sorted(boundary, after).is_ok());
         config
+    }
+}
+
+impl Default for ConfigBuffer {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -213,10 +197,10 @@ impl From<ConfigBuffer> for Config {
     }
 }
 
-pub(crate) mod errors {
+pub mod errors {
     use std::{error, fmt};
 
-    use crate::ConfigBuffer;
+    use crate::config::ConfigBuffer;
 
     #[derive(Clone, Copy)]
     pub struct AtCapacityError {}
@@ -312,20 +296,6 @@ pub(crate) mod errors {
     }
 
     #[derive(Clone, Copy)]
-    pub struct EmptyError {}
-    impl fmt::Debug for EmptyError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("EmptyError").finish()
-        }
-    }
-    impl fmt::Display for EmptyError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "cannot pop from empty config buffer")
-        }
-    }
-    impl error::Error for EmptyError {}
-
-    #[derive(Clone, Copy)]
     pub struct NotFoundError {
         pub(crate) boundary: u8,
     }
@@ -352,4 +322,26 @@ pub(crate) mod errors {
         }
     }
     impl error::Error for NotFoundError {}
+}
+
+#[cfg(test)]
+mod test {
+    use crate::config::{ConfigBuffer, Sort};
+
+    #[test]
+    fn single_sorted() {
+        let buffer = ConfigBuffer::single_sorted(Sort::Increasing, 128, Sort::Decreasing);
+        assert_eq!(buffer.len.get(), 2);
+        assert_eq!(
+            buffer.boundaries(),
+            &[(0, Sort::Increasing), (128, Sort::Decreasing)]
+        );
+
+        let config = buffer.finish();
+        assert_eq!(&config.boundaries[..2], &[128, 0]);
+        assert_eq!(
+            config.sort,
+            Sort::Increasing.get() | Sort::Decreasing.get() << 2,
+        );
+    }
 }

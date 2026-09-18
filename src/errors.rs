@@ -1,8 +1,6 @@
 use std::{error, fmt, num::NonZero};
 
-use crate::{CONFIG_SIZE, IMMEDIATES_SIZE, TAGGED_IMAGE_UNIT_SIZE, U32_SIZE, Vec2U32};
-
-pub use crate::config::errors::*;
+use crate::{IMMEDIATES_SIZE, TAGGED_IMAGE_UNIT_SIZE, U32_SIZE, Vec2U32, config::CONFIG_SIZE};
 
 #[derive(Clone, Copy)]
 pub struct OversizedImmediatesError {

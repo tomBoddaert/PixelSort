@@ -1,4 +1,5 @@
 /target
 
 examples/test.rs
-comparison.xcf
+examples/comparison.rs
+comparison

@@ -11,12 +11,12 @@ var<storage, read> image: array<u32>;
 @vertex
 fn vertex(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
     const pos = array(
-        vec4<f32>(-1.0, -1.0, 0.0, 1.0),
-        vec4<f32>(-1.0, 1.0, 0.0, 1.0),
-        vec4<f32>(1.0, 1.0, 0.0, 1.0),
-        vec4<f32>(1.0, 1.0, 0.0, 1.0),
-        vec4<f32>(1.0, -1.0, 0.0, 1.0),
-        vec4<f32>(-1.0, -1.0, 0.0, 1.0),
+        vec4<f32>(-1f, -1f, 0f, 1f),
+        vec4<f32>(-1f,  1f, 0f, 1f),
+        vec4<f32>( 1f,  1f, 0f, 1f),
+        vec4<f32>( 1f,  1f, 0f, 1f),
+        vec4<f32>( 1f, -1f, 0f, 1f),
+        vec4<f32>(-1f, -1f, 0f, 1f),
     );
     return pos[vertex_index];
 }
@@ -39,5 +39,5 @@ fn fragment(@builtin(position) coord_in: vec4<f32>) -> @location(0) vec4<f32> {
     let i = coord.y * immediates.image_size.x + coord.x;
     let rgb = unpack4x8unorm(image[i]).xyz;
 
-    return vec4(rgb, 1);
+    return vec4(rgb, 1f);
 }

@@ -9,7 +9,8 @@ use std::{
 
 use eframe::{egui, egui_wgpu};
 use pixel_sort::{
-    CONFIG_SIZE, Config, ConfigBuffer, PixelSort, Vec2U32, add_requred_features_and_limits,
+    PixelSort, Vec2U32, add_requred_features_and_limits,
+    config::{self, CONFIG_SIZE, Config},
     utils::{U32_SIZE, const_max_u32_slice, const_size_of_u32},
 };
 
@@ -227,7 +228,12 @@ impl eframe::App for App {
                 }
 
                 let config = threshold_updated.then(|| {
-                    ConfigBuffer::single_sorted(true, (self.threshold * 255.) as u8, true).finish()
+                    config::ConfigBuffer::single_sorted(
+                        config::Sort::Increasing,
+                        (self.threshold * 255.) as u8,
+                        config::Sort::Increasing,
+                    )
+                    .finish()
                 });
 
                 ui.add(Viewer {
@@ -437,12 +443,5 @@ fn download_write_image(render_state: &egui_wgpu::RenderState, image_size: Vec2U
     rgb.copy_from_color_space(&rgba, image::ConvertColorOptions::default())
         .unwrap();
 
-    image::save_buffer(
-        path,
-        &rgb,
-        image_size.x,
-        image_size.y,
-        image::ColorType::Rgb8,
-    )
-    .unwrap();
+    rgb.save(path).unwrap();
 }

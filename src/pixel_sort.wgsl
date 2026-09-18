@@ -10,9 +10,7 @@ struct Immediates {
 var<immediate> immediates: Immediates;
 
 struct Config {
-    len: u32,
-    // Must be vec4<u32> to have stride of 16 bytes (required for uniform arrays)
-    boundaries: array<vec4<u32>, 2>,
+    boundaries: vec4<u32>,
     sort: u32,
 }
 
@@ -65,7 +63,7 @@ fn count_regions(id: vec2<u32>, height: u32) -> u32 {
 
     for (var i = block_base + stride; i <= block_top; i += stride) {
         let current = source_boundary_id(i);
-        region_count += u32(previous != current || !is_sorted(current));
+        region_count += u32(previous != current);
         previous = current;
     }
 
@@ -113,17 +111,19 @@ fn label_regions(
 
     let rgb = image[rotated_iter.block_base];
     let value = get_value(rgb);
-    write_tagged(y_offset + block_base, rgb, region_counter, value);
+    let current = find_boundary_id(value);
+    write_tagged(y_offset + block_base, rgb, region_counter, current, value);
 
-    var previous = find_boundary_id(value);
+    var previous = current;
 
     var j = rotated_iter.block_base + rotated_iter.stride;
     for (var i = block_base + 1u; i < block_top; i++) {
         let rgb = image[j];
         let value = get_value(rgb);
         let current = find_boundary_id(value);
-        region_counter += u32(current != previous || !is_sorted(current));
-        write_tagged(y_offset + i, rgb, region_counter, value);
+        region_counter += u32(current != previous);
+
+        write_tagged(y_offset + i, rgb, region_counter, current, value);
 
         previous = current;
         j += rotated_iter.stride;
@@ -277,20 +277,18 @@ fn get_value(rgb: u32) -> f32 {
 }
 fn find_boundary_id(value: f32) -> u32 {
     var i = 0u;
-    var boundaries4x4: vec4<u32>;
     var boundaries4: vec4<f32>;
 
-    for (; i < config.len; i++) {
-        if (i % 16u == 0) {
-            boundaries4x4 = config.boundaries[i / 16u];
-        }
+    loop {
         if (i % 4u == 0) {
-            boundaries4 = unpack4x8unorm(boundaries4x4[(i % 16u) / 4u]);
+            boundaries4 = unpack4x8unorm(config.boundaries[i / 4u]);
         }
+        let boundary = boundaries4[i % 4u];
 
-        if (boundaries4[i % 4u] > value) {
+        if (boundary == 0 || boundary > value) {
             break;
         }
+        i++;
     }
 
     return i;
@@ -301,19 +299,30 @@ fn get_boundary_id(rgb: u32) -> u32 {
 fn source_boundary_id(index: u32) -> u32 {
     return get_boundary_id(image[index]);
 }
-fn is_sorted(boundary_id: u32) -> bool {
-    return (config.sort & (1u << boundary_id)) != 0u;
+fn sorted(boundary_id: u32) -> u32 {
+    return extractBits(config.sort, boundary_id << 1u, 2u);
 }
 
 fn write_tagged(
     index: u32,
     rgb: u32,
     change_count: u32,
+    boundary_id: u32,
     value: f32,
 ) {
+    var value_written: f32;
+    switch sorted(boundary_id) {
+        case 2: {
+            value_written = value;
+        }
+        case 3: {
+            value_written = 1f - value;
+        }
+        default: {}
+    }
     tagged_image[index << 1u | tagged_image_shift] = vec2<u32>(
         // pack4x8unorm places value i at bits 8×i to 8×i+7
-        (change_count << 16u) | pack4x8unorm(vec4<f32>(value, 0f, 0f, 0f)),
+        (change_count << 16u) | pack4x8unorm(vec4<f32>(value_written, 0f, 0f, 0f)),
         rgb,
     );
 }

@@ -1,6 +1,7 @@
 use std::num::NonZero;
 
 use crate::{
+    config::CONFIG_SIZE,
     errors::{
         CopyImageError, NewError, OversizedBufferError, OversizedBufferLimit, OversizedImageError,
         OversizedImmediatesError, SizeOverflowError, UndersizedConfigBufferError,
@@ -8,10 +9,9 @@ use crate::{
     utils::{U32_SIZE, U64_SIZE, const_size_of_u32},
 };
 
-mod config;
+pub mod config;
 pub mod errors;
 pub mod utils;
-pub use config::*;
 
 pub const BIT_LEN: u32 = 4;
 pub const BASE: u32 = 2_u32.pow(BIT_LEN);
@@ -56,8 +56,8 @@ pub struct Vec2U32 {
 impl Vec2U32 {
     #[must_use]
     #[inline]
-    pub fn product(self) -> u64 {
-        u64::from(self.x) * u64::from(self.y)
+    pub const fn product(self) -> u64 {
+        (self.x as u64) * (self.y as u64)
     }
 }
 
@@ -411,8 +411,9 @@ mod test {
     use wgpu::util::DeviceExt;
 
     use crate::{
-        BASE, Binding, CONFIG_SIZE, Config, ConfigBuffer, IMMEDIATES_SIZE, Immediates, PixelSort,
+        BASE, Binding, CONFIG_SIZE, IMMEDIATES_SIZE, Immediates, PixelSort,
         SHADER_MODULE_DESCRIPTOR, Vec2U32,
+        config::{self, Config},
         utils::{
             const_size_of_u32, const_size_of_u64, const_size_of_value_u64, const_u32_to_usize,
             const_u64_to_usize,
@@ -475,8 +476,7 @@ mod test {
     const IMAGE_SIZE: Vec2U32 = Vec2U32 { x: 18, y: 3 };
     const IMAGE_WIDTH_USIZE: usize = const_u32_to_usize(IMAGE_SIZE.x);
     const IMAGE_HEIGHT_USIZE: usize = const_u32_to_usize(IMAGE_SIZE.y);
-    const IMAGE_PIXELS: NonZero<u64> =
-        NonZero::new(IMAGE_SIZE.x as u64 * IMAGE_SIZE.y as u64).unwrap();
+    const IMAGE_PIXELS: NonZero<u64> = NonZero::new(IMAGE_SIZE.product()).unwrap();
     const IMAGE_PIXELS_USIZE: usize = const_u64_to_usize(IMAGE_PIXELS.get());
     const IMAGE_VALUE: [[u8; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = [
         [
@@ -505,7 +505,12 @@ mod test {
 
         image
     };
-    const CONFIG: Config = ConfigBuffer::single_sorted(true, 128, true).finish();
+    const CONFIG: Config = config::ConfigBuffer::single_sorted(
+        config::Sort::Increasing,
+        128,
+        config::Sort::Increasing,
+    )
+    .finish();
     const BLOCK_SIZE: u32 = IMAGE_SIZE.x.div_ceil(WORKGROUP_SIZE);
     const _BOUNDED: [[u8; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = [
         [0; IMAGE_WIDTH_USIZE],
