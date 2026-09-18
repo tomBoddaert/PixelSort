@@ -1,9 +1,11 @@
+use std::num::NonZero;
+
 use crate::{
     errors::{
-        CopyError, NewError, OversizedBufferError, OversizedImageError, OversizedImmediatesError,
-        SizeOverflowError,
+        CopyImageError, NewError, OversizedBufferError, OversizedBufferLimit, OversizedImageError,
+        OversizedImmediatesError, SizeOverflowError, UndersizedConfigBufferError,
     },
-    utils::{U32_SIZE, U64_SIZE, const_size_of_u32, const_size_of_u64},
+    utils::{U32_SIZE, U64_SIZE, const_size_of_u32},
 };
 
 mod config;
@@ -71,10 +73,12 @@ pub struct PixelSort {
 }
 
 impl PixelSort {
+    // TODO: remove NonZero?
+    // TODO: lower overflow checks to u32, as GPU indexing is done with u32, not u64
     pub fn new(
         device: &wgpu::Device,
         workgroup_size: u32,
-        max_pixels: u64,
+        max_pixels: NonZero<u64>,
     ) -> Result<Self, NewError> {
         let limits = device.limits();
 
@@ -89,26 +93,40 @@ impl PixelSort {
 
         // Largest buffer size needed
         let tagged_image_size = max_pixels
+            .get()
             .checked_mul(TAGGED_IMAGE_UNIT_SIZE)
             .ok_or(SizeOverflowError { max_pixels })?;
-        if tagged_image_size
-            > limits
-                .max_buffer_size
-                .min(limits.max_storage_buffer_binding_size)
-        {
-            return Err(OversizedBufferError {
-                size: tagged_image_size,
-                max_buffer_size: limits.max_buffer_size,
-                max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
-            }
-            .into());
-        }
+
+        let max_size = tagged_image_size > CONFIG_SIZE.get();
+        OversizedBufferError::check(
+            if max_size {
+                errors::SizeSource::Image { pixels: max_pixels }
+            } else {
+                errors::SizeSource::Config
+            },
+            OversizedBufferLimit::MaxBufferSize.create(&limits),
+            if max_size {
+                tagged_image_size
+            } else {
+                CONFIG_SIZE.get()
+            },
+        )?;
+        OversizedBufferError::check(
+            errors::SizeSource::Image { pixels: max_pixels },
+            OversizedBufferLimit::MaxStorageBufferBindingSize.create(&limits),
+            tagged_image_size,
+        )?;
+        OversizedBufferError::check(
+            errors::SizeSource::Config,
+            OversizedBufferLimit::MaxUniformBufferBindingSize.create(&limits),
+            CONFIG_SIZE.get(),
+        )?;
 
         let module = device.create_shader_module(SHADER_MODULE_DESCRIPTOR);
 
         let input = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("PixelSort::input"),
-            size: max_pixels * U32_SIZE.get(),
+            size: max_pixels.get() * U32_SIZE.get(),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -129,7 +147,7 @@ impl PixelSort {
 
         let config = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("PixelSort::config"),
-            size: const { const_size_of_u64::<Config>() },
+            size: CONFIG_SIZE.get(),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -224,7 +242,7 @@ impl PixelSort {
         });
 
         Ok(Self {
-            max_pixels,
+            max_pixels: max_pixels.get(),
             input,
             config,
             tagged_image,
@@ -235,13 +253,14 @@ impl PixelSort {
         })
     }
 
+    // TODO: zero check
     pub fn copy_to_input(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         image: &wgpu::Buffer,
         image_size: Vec2U32,
-    ) -> Result<(), CopyError> {
-        let size = CopyError::check(image_size, self.max_pixels, image.size())?;
+    ) -> Result<(), CopyImageError> {
+        let size = CopyImageError::check(image_size, self.max_pixels, image.size())?;
         encoder.copy_buffer_to_buffer(image, 0, &self.input, 0, size);
         Ok(())
     }
@@ -249,30 +268,43 @@ impl PixelSort {
     pub fn copy_to_config(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        config: &wgpu::Buffer,
-    ) -> Result<(), ()> {
-        if config.size() < CONFIG_SIZE.get() {
-            return Err(());
-        }
-        encoder.copy_buffer_to_buffer(config, 0, &self.config, 0, CONFIG_SIZE.get());
+        configs: &wgpu::Buffer,
+        offset: u32,
+    ) -> Result<(), UndersizedConfigBufferError> {
+        let byte_offset = UndersizedConfigBufferError::check(configs.size(), offset)?;
+        encoder.copy_buffer_to_buffer(configs, byte_offset, &self.config, 0, CONFIG_SIZE.get());
         Ok(())
     }
 
+    // TODO: zero check
     pub fn copy_from_output(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::Buffer,
         image_size: Vec2U32,
-    ) -> Result<(), CopyError> {
-        let size = CopyError::check(image_size, self.max_pixels, output.size())?;
+    ) -> Result<(), CopyImageError> {
+        let size = CopyImageError::check(image_size, self.max_pixels, output.size())?;
         encoder.copy_buffer_to_buffer(&self.output, 0, output, 0, size);
         Ok(())
     }
 
+    // TODO: zero check
+    pub fn copy_output_to_input(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        image_size: Vec2U32,
+    ) -> Result<(), OversizedImageError> {
+        let pixels = OversizedImageError::check(image_size, self.max_pixels)?;
+        encoder.copy_buffer_to_buffer(&self.output, 0, &self.input, 0, pixels * U32_SIZE.get());
+        Ok(())
+    }
+
+    // TODO: zero check
     pub fn add_step(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         image_size: Vec2U32,
+        vertical: bool,
     ) -> Result<(), OversizedImageError> {
         OversizedImageError::check(image_size, self.max_pixels)?;
 
@@ -283,18 +315,36 @@ impl PixelSort {
 
         compute_pass.set_pipeline(&self.pipeline);
         compute_pass.set_bind_group(0, &self.bind_group, &[]);
-        let block_size = image_size.x.div_ceil(self.workgroup_size);
+        let width = if vertical { image_size.y } else { image_size.x };
+        let block_size = width.div_ceil(self.workgroup_size);
         compute_pass.set_immediates(
             0,
             bytemuck::bytes_of(&Immediates {
-                width: image_size.x,
+                width,
                 block_size,
+                vertical: vertical.into(),
             }),
         );
 
-        compute_pass.dispatch_workgroups(1, image_size.y, 1);
+        compute_pass.dispatch_workgroups(1, if vertical { image_size.x } else { image_size.y }, 1);
 
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+pub struct BoolU32(pub u32);
+impl From<bool> for BoolU32 {
+    #[inline]
+    fn from(value: bool) -> Self {
+        Self(value.into())
+    }
+}
+impl From<BoolU32> for bool {
+    #[inline]
+    fn from(value: BoolU32) -> Self {
+        value.0 != 0
     }
 }
 
@@ -303,21 +353,29 @@ impl PixelSort {
 pub struct Immediates {
     pub width: u32,
     pub block_size: u32,
+    pub vertical: BoolU32,
 }
 
 #[inline]
-pub const fn required_buffer_size(max_pixels: u64) -> Result<u64, SizeOverflowError> {
-    if let Some(size) = max_pixels.checked_mul(TAGGED_IMAGE_UNIT_SIZE) {
+pub const fn required_storage_buffer_binding_size(
+    max_pixels: NonZero<u64>,
+) -> Result<u64, SizeOverflowError> {
+    if let Some(size) = max_pixels.get().checked_mul(TAGGED_IMAGE_UNIT_SIZE) {
         Ok(size)
     } else {
         Err(SizeOverflowError { max_pixels })
     }
 }
+#[inline]
+pub const fn required_uniform_buffer_binding_size() -> u64 {
+    CONFIG_SIZE.get()
+}
 pub fn add_requred_features_and_limits(
     mut device_descriptor: wgpu::DeviceDescriptor,
-    max_pixels: u64,
+    max_pixels: NonZero<u64>,
 ) -> Result<wgpu::DeviceDescriptor, SizeOverflowError> {
-    let size = required_buffer_size(max_pixels)?;
+    let storage_size = required_storage_buffer_binding_size(max_pixels)?;
+    let uniform_size = required_uniform_buffer_binding_size();
 
     device_descriptor.required_features |= REQUIRED_FEATURES;
 
@@ -325,14 +383,23 @@ pub fn add_requred_features_and_limits(
         .required_limits
         .max_immediate_size
         .max(IMMEDIATES_SIZE);
+    device_descriptor.required_limits.max_buffer_size = device_descriptor
+        .required_limits
+        .max_buffer_size
+        .max(storage_size)
+        .max(uniform_size);
     device_descriptor
         .required_limits
         .max_storage_buffer_binding_size = device_descriptor
         .required_limits
         .max_storage_buffer_binding_size
-        .max(size);
-    device_descriptor.required_limits.max_buffer_size =
-        device_descriptor.required_limits.max_buffer_size.max(size);
+        .max(storage_size);
+    device_descriptor
+        .required_limits
+        .max_uniform_buffer_binding_size = device_descriptor
+        .required_limits
+        .max_uniform_buffer_binding_size
+        .max(uniform_size);
 
     Ok(device_descriptor)
 }
@@ -360,7 +427,7 @@ mod test {
     static STATE: OnceLock<State> = OnceLock::new();
     fn get_state() -> &'static State {
         STATE.get_or_init(|| {
-            env_logger::init();
+            // env_logger::init();
 
             let instance =
                 wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -408,8 +475,9 @@ mod test {
     const IMAGE_SIZE: Vec2U32 = Vec2U32 { x: 18, y: 3 };
     const IMAGE_WIDTH_USIZE: usize = const_u32_to_usize(IMAGE_SIZE.x);
     const IMAGE_HEIGHT_USIZE: usize = const_u32_to_usize(IMAGE_SIZE.y);
-    const IMAGE_PIXELS: u64 = IMAGE_SIZE.x as u64 * IMAGE_SIZE.y as u64;
-    const IMAGE_PIXELS_USIZE: usize = const_u64_to_usize(IMAGE_PIXELS);
+    const IMAGE_PIXELS: NonZero<u64> =
+        NonZero::new(IMAGE_SIZE.x as u64 * IMAGE_SIZE.y as u64).unwrap();
+    const IMAGE_PIXELS_USIZE: usize = const_u64_to_usize(IMAGE_PIXELS.get());
     const IMAGE_VALUE: [[u8; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = [
         [
             0x26, 0x49, 0x17, 0x6a, /**/ 0x40, 0x2c, 0x0d, 0x20, /**/ 0x7e, 0x21, 0x4d,
@@ -439,18 +507,18 @@ mod test {
     };
     const CONFIG: Config = ConfigBuffer::single_sorted(true, 128, true).finish();
     const BLOCK_SIZE: u32 = IMAGE_SIZE.x.div_ceil(WORKGROUP_SIZE);
-    const THRESHOLDED: [[bool; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = [
-        [false; IMAGE_WIDTH_USIZE],
+    const _BOUNDED: [[u8; IMAGE_WIDTH_USIZE]; IMAGE_HEIGHT_USIZE] = [
+        [0; IMAGE_WIDTH_USIZE],
         [
-            false, true, false, false, /**/ false, false, false, false, /**/ false, true,
-            true, true, /**/ false, false, false, false, /**/ true, false,
+            0, 1, 0, 0, /**/ 0, 0, 0, 0, /**/ 0, 1, 1, 1, /**/ 0, 0, 0, 0,
+            /**/ 1, 0,
         ],
         [
-            true, false, true, false, /**/ true, false, true, false, /**/ true, false,
-            true, false, /**/ true, false, true, false, /**/ true, false,
+            1, 0, 1, 0, /**/ 1, 0, 1, 0, /**/ 1, 0, 1, 0, /**/ 1, 0, 1, 0,
+            /**/ 1, 0,
         ],
     ];
-    const PREVIOUS_BLOCK_CHANGE_COUNT: [[u32; WORKGROUP_SIZE_USIZE]; IMAGE_HEIGHT_USIZE] =
+    const PREVIOUS_BLOCK_REGION_COUNT: [[u32; WORKGROUP_SIZE_USIZE]; IMAGE_HEIGHT_USIZE] =
         [[0; 5], [0, 2, 0, 2, 1], [0, 4, 4, 4, 4]];
     const PREVIOUS_BLOCK_TAG: [[u32; WORKGROUP_SIZE_USIZE]; IMAGE_HEIGHT_USIZE] =
         [[0; 5], [0, 2, 2, 4, 5], [0, 4, 8, 12, 16]];
@@ -539,7 +607,7 @@ mod test {
             [1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
         ],
     ];
-    const VALUE_P_COUNT: [[[u32; const_u32_to_usize(BASE)]; WORKGROUP_SIZE_USIZE];
+    const _VALUE_P_COUNT: [[[u32; const_u32_to_usize(BASE)]; WORKGROUP_SIZE_USIZE];
         IMAGE_HEIGHT_USIZE] = [
         [
             //0 1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
@@ -629,7 +697,7 @@ mod test {
     enum BufferSetup<T, Size = u64> {
         #[default]
         None,
-        Uninitialised(Size),
+        _Uninitialised(Size),
         UninitialisedFrom(T),
         Initialised(T),
     }
@@ -655,12 +723,14 @@ mod test {
                     usage,
                     mapped_at_creation: false,
                 }),
-                BufferSetup::Uninitialised(size) => device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(label),
-                    size,
-                    usage,
-                    mapped_at_creation: false,
-                }),
+                BufferSetup::_Uninitialised(size) => {
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(label),
+                        size,
+                        usage,
+                        mapped_at_creation: false,
+                    })
+                }
                 BufferSetup::UninitialisedFrom(value) => {
                     device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some(label),
@@ -703,7 +773,7 @@ mod test {
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum DownloadSource {
-        Output,
+        _Output,
         TaggedImage,
         TestBuffer,
     }
@@ -716,8 +786,8 @@ mod test {
     }
     struct Instance {
         state: &'static State,
-        input: Buffer,
-        config: Buffer,
+        _input: Buffer,
+        _config: Buffer,
         tagged_image: Buffer,
         output: Buffer,
         bind_group: wgpu::BindGroup,
@@ -750,7 +820,7 @@ mod test {
         let options = Setup {
             input: match input {
                 BufferSetup::None => BufferSetup::None,
-                BufferSetup::Uninitialised(size) => BufferSetup::Uninitialised(size),
+                BufferSetup::_Uninitialised(size) => BufferSetup::_Uninitialised(size),
                 BufferSetup::UninitialisedFrom(value) => {
                     BufferSetup::UninitialisedFrom(value.unwrap_or(&IMAGE))
                 }
@@ -760,7 +830,7 @@ mod test {
             },
             tagged_image: match tagged_image {
                 BufferSetup::None => BufferSetup::None,
-                BufferSetup::Uninitialised(size) => BufferSetup::Uninitialised(size),
+                BufferSetup::_Uninitialised(size) => BufferSetup::_Uninitialised(size),
                 BufferSetup::UninitialisedFrom(value) => {
                     BufferSetup::UninitialisedFrom(value.unwrap_or(&TAGGED_IMAGE))
                 }
@@ -770,8 +840,8 @@ mod test {
             },
             output: match output {
                 BufferSetup::None => BufferSetup::None,
-                BufferSetup::Uninitialised(size) => {
-                    BufferSetup::Uninitialised(size.unwrap_or(const_size_of_value_u64(&IMAGE)))
+                BufferSetup::_Uninitialised(size) => {
+                    BufferSetup::_Uninitialised(size.unwrap_or(const_size_of_value_u64(&IMAGE)))
                 }
                 BufferSetup::UninitialisedFrom(value) => BufferSetup::UninitialisedFrom(value),
                 BufferSetup::Initialised(value) => BufferSetup::Initialised(value),
@@ -867,7 +937,7 @@ mod test {
         let download = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("download"),
             size: match download_source {
-                DownloadSource::Output => &output,
+                DownloadSource::_Output => &output,
                 DownloadSource::TaggedImage => &tagged_image,
                 DownloadSource::TestBuffer => &test_buffer,
             }
@@ -879,8 +949,8 @@ mod test {
 
         Instance {
             state,
-            input,
-            config,
+            _input: input,
+            _config: config,
             tagged_image,
             output,
             bind_group,
@@ -912,13 +982,14 @@ mod test {
                 bytemuck::bytes_of(&Immediates {
                     width: IMAGE_SIZE.x,
                     block_size: BLOCK_SIZE,
+                    vertical: false.into(),
                 }),
             );
             compute_pass.dispatch_workgroups(1, IMAGE_SIZE.y, 1);
             drop(compute_pass);
 
             let download_source = &match self.download_source {
-                DownloadSource::Output => &self.output,
+                DownloadSource::_Output => &self.output,
                 DownloadSource::TaggedImage => &self.tagged_image,
                 DownloadSource::TestBuffer => &self.test_buffer,
             }
@@ -946,23 +1017,23 @@ mod test {
     }
 
     #[test]
-    fn change_count() {
+    fn region_count() {
         let instance = setup(
             Setup {
                 input: BufferSetup::Initialised(None),
                 test_buffer: BufferSetup::UninitialisedFrom(
-                    PREVIOUS_BLOCK_CHANGE_COUNT.as_flattened(),
+                    PREVIOUS_BLOCK_REGION_COUNT.as_flattened(),
                 ),
                 ..Setup::default()
             },
-            "test_change_count",
+            "test_region_count",
             DownloadSource::TestBuffer,
         );
 
         let downloaded = instance.submit();
         let result = bytemuck::cast_slice::<u8, [u32; _]>(&downloaded);
 
-        assert_eq!(result, PREVIOUS_BLOCK_CHANGE_COUNT);
+        assert_eq!(result, PREVIOUS_BLOCK_REGION_COUNT);
     }
 
     #[test]
@@ -970,7 +1041,7 @@ mod test {
         let instance = setup(
             Setup {
                 input: BufferSetup::Initialised(None),
-                test_buffer: BufferSetup::UninitialisedFrom(PREVIOUS_BLOCK_TAG.as_flattened()),
+                test_buffer: BufferSetup::Initialised(PREVIOUS_BLOCK_REGION_COUNT.as_flattened()),
                 ..Setup::default()
             },
             "test_wg_partial_sum",
@@ -989,6 +1060,7 @@ mod test {
             Setup {
                 input: BufferSetup::Initialised(None),
                 tagged_image: BufferSetup::UninitialisedFrom(None),
+                test_buffer: BufferSetup::Initialised(PREVIOUS_BLOCK_TAG.as_flattened()),
                 ..Setup::default()
             },
             "test_label_regions",
@@ -1165,8 +1237,10 @@ mod test {
         pixel_sort
             .copy_to_input(&mut encoder, &image, IMAGE_SIZE)
             .unwrap();
-        pixel_sort.copy_to_config(&mut encoder, &config).unwrap();
-        pixel_sort.add_step(&mut encoder, IMAGE_SIZE).unwrap();
+        pixel_sort.copy_to_config(&mut encoder, &config, 0).unwrap();
+        pixel_sort
+            .add_step(&mut encoder, IMAGE_SIZE, false)
+            .unwrap();
         encoder.copy_buffer_to_buffer(
             &pixel_sort.tagged_image,
             0,

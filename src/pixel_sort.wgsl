@@ -5,6 +5,7 @@ override workgroup_size: u32;
 struct Immediates {
     width: u32,
     block_size: u32,
+    vertical: u32,
 }
 var<immediate> immediates: Immediates;
 
@@ -26,40 +27,49 @@ var<private> tagged_image_shift = 0u;
 var<storage, read_write> output: array<u32>;
 
 @compute @workgroup_size(workgroup_size)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
     let y_offset = immediates.width * id.y;
 
-    let change_count = count_changes(id.x, y_offset);
-    let offset = wg_partial_sum(id.x, change_count);
-    label_regions(id.x, y_offset, offset);
+    let region_count = count_regions(id.xy, num_workgroups.y);
+    let region_offset = wg_partial_sum(id.x, region_count);
+    label_regions(id.xy, num_workgroups.y, y_offset, region_offset);
 
     sort(id.x, y_offset);
 
-    write_image(id.x, y_offset);
+    write_image(id.xy, num_workgroups.y, y_offset);
 }
 
-fn count_changes(id: u32, y_offset: u32) -> u32 {
+fn count_regions(id: vec2<u32>, height: u32) -> u32 {
     if (
-        id == 0u
-        || id >= ceil_div(immediates.width, immediates.block_size)
+        id.x == 0u
+        || id.x >= ceil_div(immediates.width, immediates.block_size)
     ) {
         return 0u;
     }
 
-    let block_base = immediates.block_size * (id - 1u);
-    // Does not include the last block, so a integer multiple of the block size + 1
-    let block_top = block_base + immediates.block_size + 1u;
+    let block_offset = (id.x - 1u) * immediates.block_size;
+    let y_offset = id.y * select(immediates.width, 1u, bool(immediates.vertical));
+    let stride = select(1u, height, bool(immediates.vertical));
 
-    var change_count = 0u;
-    var previous = source_boundary_id(y_offset + block_base);
+    var i = y_offset + block_offset * stride;
 
-    for (var i = block_base + 1u; i < block_top; i++) {
-        let current = source_boundary_id(y_offset + i);
-        change_count += u32(previous != current || !is_sorted(current));
+    let block_base = y_offset + block_offset * stride;
+    // Does not include the last block, so a integer multiple of the block size
+    let block_top = block_base + immediates.block_size * stride;
+
+    var region_count = 0u;
+    var previous = source_boundary_id(block_base);
+
+    for (var i = block_base + stride; i <= block_top; i += stride) {
+        let current = source_boundary_id(i);
+        region_count += u32(previous != current || !is_sorted(current));
         previous = current;
     }
 
-    return change_count;
+    return region_count;
 }
 
 var<workgroup> wg_buffer: array<u32, workgroup_size * 2u>;
@@ -85,33 +95,38 @@ fn wg_partial_sum(id: u32, count: u32) -> u32 {
 }
 
 fn label_regions(
-    id: u32,
+    id: vec2<u32>,
+    height: u32,
     y_offset: u32,
-    offset: u32,
+    region_offset: u32,
 ) {
-    if (id >= ceil_div(immediates.width, immediates.block_size)) {
+    if (id.x >= ceil_div(immediates.width, immediates.block_size)) {
         return;
     }
 
-    let block_base = immediates.block_size * id;
+    let rotated_iter = image_iter(id, height);
+
+    let block_base = immediates.block_size * id.x;
     let block_top = min(block_base + immediates.block_size, immediates.width);
 
-    var change_count = offset;
+    var region_counter = region_offset;
 
-    let rgb = image[y_offset + block_base];
+    let rgb = image[rotated_iter.block_base];
     let value = get_value(rgb);
-    write_tagged(y_offset + block_base, rgb, change_count, value);
+    write_tagged(y_offset + block_base, rgb, region_counter, value);
 
     var previous = find_boundary_id(value);
 
+    var j = rotated_iter.block_base + rotated_iter.stride;
     for (var i = block_base + 1u; i < block_top; i++) {
-        let rgb = image[y_offset + i];
+        let rgb = image[j];
         let value = get_value(rgb);
         let current = find_boundary_id(value);
-        change_count += u32(current != previous || !is_sorted(current));
-        write_tagged(y_offset + i, rgb, change_count, value);
+        region_counter += u32(current != previous || !is_sorted(current));
+        write_tagged(y_offset + i, rgb, region_counter, value);
 
         previous = current;
+        j += rotated_iter.stride;
     }
 }
 
@@ -219,17 +234,40 @@ fn reorder(
     storageBarrier();
 }
 
-fn write_image(id: u32, y_offset: u32) {
-    let block_base = immediates.block_size * id;
+fn write_image(id: vec2<u32>, height: u32, y_offset: u32) {
+    let rotated_iter = image_iter(id, height);
+
+    let block_base = immediates.block_size * id.x;
     let block_top = min(block_base + immediates.block_size, immediates.width);
+
+    var j = rotated_iter.block_base;
     for (var i = block_base; i < block_top; i++) {
         let rgb = read_tagged(y_offset + i).y;
-        output[y_offset + i] = rgb;
+        output[j] = rgb;
+
+        j += rotated_iter.stride;
     }
 }
 
 fn ceil_div(lhs: u32, rhs: u32) -> u32 {
     return (lhs + rhs - 1u) / rhs;
+}
+
+struct ImageIter {
+    block_base: u32,
+    block_top: u32,
+    stride: u32,
+}
+fn image_iter(id: vec2<u32>, height: u32) -> ImageIter {
+    let block_offset = id.x * immediates.block_size;
+    let y_offset = id.y * select(immediates.width, 1u, bool(immediates.vertical));
+    let stride = select(1u, height, bool(immediates.vertical));
+
+    return ImageIter (
+        y_offset + block_offset * stride,
+        y_offset + min(block_offset + immediates.block_size, immediates.width) * stride,
+        stride,
+    );
 }
 
 fn get_value(rgb: u32) -> f32 {
@@ -289,31 +327,33 @@ fn read_tagged(index: u32) -> vec2<u32> {
 var<storage, read_write> test_buffer: array<u32>;
 
 @compute @workgroup_size(workgroup_size)
-fn test_change_count(@builtin(global_invocation_id) id: vec3<u32>) {
-    let y_offset = immediates.width * id.y;
-
-    let change_count = count_changes(id.x, y_offset);
+fn test_region_count(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    let change_count = count_regions(id.xy, num_workgroups.y);
 
     test_buffer[workgroup_size * id.y + id.x] = change_count;
 }
 
 @compute @workgroup_size(workgroup_size)
 fn test_wg_partial_sum(@builtin(global_invocation_id) id: vec3<u32>) {
-    let y_offset = immediates.width * id.y;
+    let region_count = test_buffer[workgroup_size * id.y + id.x];
 
-    let change_count = count_changes(id.x, y_offset);
-    let offset = wg_partial_sum(id.x, change_count);
+    let offset = wg_partial_sum(id.x, region_count);
 
     test_buffer[workgroup_size * id.y + id.x] = offset;
 }
 
 @compute @workgroup_size(workgroup_size)
-fn test_label_regions(@builtin(global_invocation_id) id: vec3<u32>) {
+fn test_label_regions(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    let offset = test_buffer[workgroup_size * id.y + id.x];
     let y_offset = immediates.width * id.y;
 
-    let change_count = count_changes(id.x, y_offset);
-    let offset = wg_partial_sum(id.x, change_count);
-    label_regions(id.x, y_offset, offset);
+    label_regions(id.xy, num_workgroups.y, y_offset, offset);
 }
 
 @compute @workgroup_size(workgroup_size)

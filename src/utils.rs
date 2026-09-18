@@ -1,5 +1,7 @@
 use std::num::NonZero;
 
+pub const ONE: NonZero<u32> = NonZero::new(1).unwrap();
+
 pub const U32_SIZE: NonZero<u64> = NonZero::new(const_usize_to_u64(size_of::<u32>())).unwrap();
 pub const U64_SIZE: NonZero<u64> = NonZero::new(const_usize_to_u64(size_of::<u64>())).unwrap();
 

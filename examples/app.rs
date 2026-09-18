@@ -2,6 +2,7 @@
 
 use std::{
     ffi::{OsStr, OsString},
+    num::NonZero,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
 };
@@ -63,7 +64,7 @@ impl App {
 
         let image_upload = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("image_upload"),
-            size: const { MAX_IMAGE_PIXELS * U32_SIZE.get() },
+            size: const { MAX_IMAGE_PIXELS.get() * U32_SIZE.get() },
             usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: true,
         });
@@ -324,11 +325,11 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
             drop(mapped);
             config_upload.unmap();
 
-            sort.copy_to_config(egui_encoder, config_upload).unwrap();
+            sort.copy_to_config(egui_encoder, config_upload, 0).unwrap();
             egui_encoder.map_buffer_on_submit(config_upload, wgpu::MapMode::Write, .., |_| {});
         }
 
-        sort.add_step(egui_encoder, *image_size).unwrap();
+        sort.add_step(egui_encoder, *image_size, false).unwrap();
 
         Vec::new()
     }
@@ -382,7 +383,7 @@ const REQUIRED_IMMEDIATE_SIZE: u32 = const_max_u32_slice(&[
     pixel_sort::IMMEDIATES_SIZE,
     const_size_of_u32::<ViewerImmediates>(),
 ]);
-const MAX_IMAGE_PIXELS: u64 = 7680 * 4320; // 8k
+const MAX_IMAGE_PIXELS: NonZero<u64> = NonZero::new(7680 * 4320).unwrap(); // 8k
 
 fn read_image(path: &Path) -> (image::RgbaImage, Vec2U32) {
     let img = image::ImageReader::open(path)

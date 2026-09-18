@@ -12,7 +12,10 @@ pub struct ConfigBuffer {
     sort: u32,
 }
 
-// TODO: compress len + sort into one vec2? or pad boundaries with u8::MAX and remove len
+// TODO:
+// - compress len + sort into one vec2,
+// - or pad boundaries with u8::MAX and remove len,
+// - or put len at start of boundaries?
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
 pub struct Config {

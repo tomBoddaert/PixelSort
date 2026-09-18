@@ -1,3 +1,5 @@
+use std::num::NonZero;
+
 use pixel_sort::{
     Config, ConfigBuffer, Vec2U32,
     utils::{U32_SIZE, U64_SIZE},
@@ -36,7 +38,12 @@ impl framework::Example for PixelSort {
         wgpu::BindGroupLayout,
         wgpu::BindGroup,
     ) {
-        let ps = pixel_sort::PixelSort::new(device, workgroup_size, image_size.product()).unwrap();
+        let ps = pixel_sort::PixelSort::new(
+            device,
+            workgroup_size,
+            NonZero::new(image_size.product()).unwrap(),
+        )
+        .unwrap();
 
         let image_layout = wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -53,25 +60,34 @@ impl framework::Example for PixelSort {
             resource: ps.output.as_entire_binding(),
         };
 
-        const CONFIG: Config = {
-            let mut buf = ConfigBuffer::new();
-            assert!(buf.push_sorted(0, true).is_ok());
-            assert!(buf.push_sorted((0.4 * 255.) as u8, false).is_ok());
-            assert!(buf.push_sorted((0.6 * 255.) as u8, true).is_ok());
-            assert!(buf.push_sorted((0.75 * 255.) as u8, true).is_ok());
-            buf.finish()
+        const CONFIGS: [Config; 2] = {
+            let mut buf1 = ConfigBuffer::new();
+            assert!(buf1.push_sorted(0, true).is_ok());
+            assert!(buf1.push_sorted((0.4 * 255.) as u8, false).is_ok());
+
+            let mut buf2 = ConfigBuffer::new();
+            assert!(buf2.push_sorted((0.4 * 255.) as u8, true).is_ok());
+            assert!(buf2.push_sorted((0.7 * 255.) as u8, false).is_ok());
+
+            [buf1.finish(), buf2.finish()]
         };
         let config_upload = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::bytes_of(&CONFIG),
+            contents: bytemuck::bytes_of(&CONFIGS),
             usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
         });
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
         ps.copy_to_input(&mut encoder, &image, image_size).unwrap();
-        ps.copy_to_config(&mut encoder, &config_upload).unwrap();
-        ps.add_step(&mut encoder, image_size).unwrap();
+        ps.copy_to_config(&mut encoder, &config_upload, 0).unwrap();
+        ps.add_step(&mut encoder, image_size, false).unwrap();
+
+        ps.copy_output_to_input(&mut encoder, image_size).unwrap();
+        ps.copy_to_config(&mut encoder, &config_upload, 1).unwrap();
+        ps.add_step(&mut encoder, image_size, true).unwrap();
+
         let idx = queue.submit([encoder.finish()]);
         device
             .poll(wgpu::PollType::Wait {
