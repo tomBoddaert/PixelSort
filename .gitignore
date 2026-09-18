@@ -1,5 +1,6 @@
+.helix
 /target
 
 examples/test.rs
 examples/comparison.rs
-comparison
+comparison/
