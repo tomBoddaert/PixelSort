@@ -8,7 +8,7 @@ Pixel sorting is an [algorithmic art](https://en.wikipedia.org/wiki/Algorithmic_
 Recently, I've been playing around with GPU programming (with [wgpu](https://github.com/gfx-rs/wgpu)) and I was reminded of [Acerola's video](https://youtu.be/HMmmBDRy-jE), where he implements pixel sorting on the GPU. However, for speed, he compromises on the quality of the sort by limiting the span length. I had another idea of how to improve the performance with no compromises and this is the result.
 
 ## Current State
-This crate is in rapid development and breaking changes are being made frequently. As such, the code is a bit messy, completely undocumented, and barely tested. My current goal is to add all the features I want / can think of. Once that is complete, I will work on tidying it up and stabilising the API.
+This crate is in rapid development and breaking changes are being made frequently. As such, the code is a bit messy, barely tested, and completely undocumented. My current goal is to add all the features I want / can think of. Once that is complete, I will work on tidying it up, and stabilising and documenting the API.
 
 ## Licenses
 The `PixelSort` library is dual-licensed under either the MIT license or the Apache License Version 2.0 at your option.  

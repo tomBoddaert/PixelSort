@@ -1,25 +1,17 @@
-use std::sync::Arc;
+use std::{num::NonZero, sync::Arc};
 
-use pixel_sort::{
-    Vec2U32,
-    utils::{U32_SIZE, const_max_u32_slice, const_size_of_u32},
-};
+use pixel_sort::{Vec2U32, add_requred_features_and_limits, utils::const_size_of_u32};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 #[allow(dead_code)]
 fn main() {
-    eprintln!("This is a framework module for the other examples!");
-    eprintln!("Try 'regions' or 'sort'");
+    eprintln!("This is a framework module for other examples!");
+    eprintln!("Try 'sort'");
 }
 
 pub trait Example: Sized {
     type Immediates: bytemuck::Pod;
-
-    #[expect(unused_variables)]
-    fn get_max_buffer_size(image_size: Vec2U32) -> u64 {
-        0
-    }
 
     fn new(
         device: &wgpu::Device,
@@ -140,32 +132,25 @@ impl<E: Example> State<E> {
             panic!("Adapter does not support compute shaders");
         }
 
-        let mut required_limits = wgpu::Limits::defaults();
-        required_limits.max_immediate_size = const {
-            const_max_u32_slice(&[
-                pixel_sort::IMMEDIATES_SIZE,
-                const_size_of_u32::<E::Immediates>(),
-            ])
-        };
-        let max_buffer_size = (Vec2U32 {
-            x: img.width(),
-            y: img.height(),
-        }
-        .product()
-            * U32_SIZE.get())
-        .max(E::get_max_buffer_size(image_size));
-        required_limits.max_storage_buffer_binding_size = max_buffer_size;
-        required_limits.max_buffer_size = max_buffer_size;
+        let mut device_descriptor = add_requred_features_and_limits(
+            wgpu::DeviceDescriptor {
+                label: None,
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::defaults(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+            },
+            NonZero::new(image_size.product()).unwrap(),
+        )
+        .unwrap();
+        device_descriptor.required_limits.max_immediate_size = device_descriptor
+            .required_limits
+            .max_immediate_size
+            .max(const { const_size_of_u32::<E::Immediates>() });
 
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: None,
-            required_features: wgpu::Features::IMMEDIATES | wgpu::Features::SUBGROUP,
-            required_limits,
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::Off,
-        }))
-        .expect("Failed to create device");
+        let (device, queue) = pollster::block_on(adapter.request_device(&device_descriptor))
+            .expect("Failed to create device");
 
         let size = window.inner_size();
 

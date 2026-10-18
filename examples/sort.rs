@@ -3,7 +3,7 @@ use std::num::NonZero;
 use pixel_sort::{
     Vec2U32,
     config::{self, Config},
-    utils::{U32_SIZE, U64_SIZE},
+    utils::U32_SIZE,
 };
 use wgpu::util::DeviceExt;
 
@@ -19,13 +19,6 @@ struct PixelSort {
 
 impl framework::Example for PixelSort {
     type Immediates = Immediates;
-
-    fn get_max_buffer_size(image_size: Vec2U32) -> u64 {
-        image_size
-            .product()
-            .checked_mul(U64_SIZE.get() * 2)
-            .unwrap()
-    }
 
     fn new(
         device: &wgpu::Device,
