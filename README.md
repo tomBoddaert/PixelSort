@@ -10,6 +10,13 @@ Recently, I've been playing around with GPU programming (with [wgpu](https://git
 ## Current State
 This crate is in rapid development and breaking changes are being made frequently. As such, the code is a bit messy, barely tested, and completely undocumented. My current goal is to add all the features I want / can think of. Once that is complete, I will work on tidying it up, and stabilising and documenting the API.
 
+## App
+The included app (`pixel-sort-app` package) is an [egui](https://www.egui.rs/)-based program for interacting with pixel sorting without the need for code.
+
+![The pixel sort app with controls on the left and the sorted image on the right.](app-screenshot.png)
+
+`cargo run -p pixel-sort-app`
+
 ## Licenses
-The `PixelSort` library is dual-licensed under either the MIT license or the Apache License Version 2.0 at your option.  
+The `PixelSort` project (library and app) is dual-licensed under either the MIT license or the Apache License Version 2.0 at your option.  
 `examples/source.jpg`, `examples/source pixel-sorted.jpg`, and `comparison.png` © 2026 Tom Boddaert. All Rights Reserved. May be distributed, unmodified, as part of this repository (<https://github.com/tomBoddaert/PixelSort>) and any forks, with this license note attached.

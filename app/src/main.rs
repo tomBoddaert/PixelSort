@@ -9,11 +9,11 @@ use std::{
 
 use eframe::{egui, egui_wgpu};
 use pixel_sort::{
-    PixelSort, Vec2U32, add_requred_features_and_limits,
-    config::{self, CONFIG_SIZE},
+    Vec2U32, add_requred_features_and_limits,
     utils::{U32_SIZE, const_max_u32_slice, const_size_of_u32},
 };
 
+mod settings;
 mod viewer;
 use viewer::Viewer;
 
@@ -57,7 +57,9 @@ struct App {
     initial_image: Option<image::RgbaImage>,
     current_image: PathBuf,
     image_size: Vec2U32,
-    threshold: f32,
+    settings: Vec<(settings::Settings, bool)>,
+    #[cfg(feature = "screenshot")]
+    show_screenshot_button: bool,
 }
 
 impl App {
@@ -68,97 +70,13 @@ impl App {
         let current_image = std::path::absolute("examples/source.jpg").unwrap();
         let (img, image_size) = read_image(&current_image);
 
-        let image_upload = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("image_upload"),
-            size: const { MAX_IMAGE_PIXELS.get() * U32_SIZE.get() },
-            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-        let config_upload = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("config_upload"),
-            size: CONFIG_SIZE.get(),
-            usage: image_upload.usage(),
-            mapped_at_creation: true,
-        });
-        let download = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("download"),
-            size: image_upload.size(),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let workgroup_size = wgpu_render_state.adapter.get_info().subgroup_max_size;
-
-        let sort = PixelSort::new(device, workgroup_size, MAX_IMAGE_PIXELS).unwrap();
-
-        let render_module = device.create_shader_module(wgpu::include_wgsl!("render.wgsl"));
-
-        let image_layout = wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: Some(U32_SIZE),
-            },
-            count: None,
-        };
-        let image_entry = wgpu::BindGroupEntry {
-            binding: image_layout.binding,
-            resource: sort.output.as_entire_binding(),
-        };
-
-        let render_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: None,
-                entries: &[image_layout],
-            });
-        let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &render_bind_group_layout,
-            entries: &[image_entry],
-        });
-
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[Some(&render_bind_group_layout)],
-                immediate_size: const { const_size_of_u32::<ViewerImmediates>() },
-            });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &render_module,
-                entry_point: Some("vertex"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &render_module,
-                entry_point: Some("fragment"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu_render_state.target_format.into())],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let viewer_resources = ViewerResources::new(device, wgpu_render_state.target_format);
 
         wgpu_render_state
             .renderer
             .write()
             .callback_resources
-            .insert(ViewerResources {
-                image_upload,
-                config_upload,
-                download,
-                sort,
-                render_bind_group,
-                render_pipeline,
-            });
+            .insert(viewer_resources);
 
         Self {
             open_image_extensions: image::ImageFormat::all()
@@ -174,7 +92,9 @@ impl App {
             initial_image: Some(img),
             current_image,
             image_size,
-            threshold: 0.5,
+            settings: vec![(settings::Settings::new(), false)],
+            #[cfg(feature = "screenshot")]
+            show_screenshot_button: true,
         }
     }
 }
@@ -184,77 +104,93 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 let mut image_update = None;
-                let mut threshold_updated = false;
+                let mut config_updated = false;
+                let mut vertical_updated = false;
 
                 ui.vertical(|ui| {
-                    ui.heading("Pixel Sort");
-                    let slider = ui.add(egui::Slider::new(&mut self.threshold, 0.0..=1.0));
-                    threshold_updated = slider.changed();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.heading("Pixel Sort");
 
-                    if ui.button("Open image file").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("image", &self.open_image_extensions)
-                            .set_directory(self.current_image.parent().unwrap())
-                            .pick_file()
-                    {
-                        let (img, image_size) = read_image(&path);
-                        self.image_size = image_size;
-                        self.current_image = path;
-                        image_update = Some(img);
-                    }
+                        #[cfg(feature = "screenshot")]
+                        {
+                            if std::mem::replace(&mut self.show_screenshot_button, false)
+                                && ui.button("Take screenshot").clicked()
+                            {
+                                ui.ctx().request_screenshot(|screenshot| {
+                                    let Some(path) = rfd::FileDialog::new()
+                                        .add_filter(
+                                            "image",
+                                            &image::ImageFormat::all()
+                                                .filter(image::ImageFormat::writing_enabled)
+                                                .flat_map(image::ImageFormat::extensions_str)
+                                                .collect::<Vec<_>>(),
+                                        )
+                                        .set_directory(std::env::current_dir().unwrap())
+                                        .save_file()
+                                    else {
+                                        return;
+                                    };
 
-                    if ui.button("Save image").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("image", &self.save_image_extensions)
-                            .set_directory(self.current_image.parent().unwrap())
-                            .set_file_name({
-                                let mut file_name =
-                                    PathBuf::from(self.current_image.file_name().unwrap());
-                                file_name.set_extension("");
-                                let mut file_name = OsString::from(file_name);
-                                file_name.push(" pixel-sorted");
-                                let mut file_name = PathBuf::from(file_name);
-                                file_name.set_extension(
-                                    self.current_image.extension().unwrap_or(OsStr::new("")),
-                                );
+                                    image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+                                        u32::try_from(screenshot.width()).unwrap(),
+                                        u32::try_from(screenshot.height()).unwrap(),
+                                        screenshot.as_raw(),
+                                    )
+                                    .unwrap()
+                                    .save(path)
+                                    .unwrap();
+                                });
+                            }
+                        }
 
-                                file_name.into_os_string().into_string().unwrap()
-                            })
-                            .save_file()
-                    {
-                        let render_state = frame.wgpu_render_state().unwrap();
-                        download_write_image(render_state, self.image_size, &path);
-                    }
+                        image_update = self.open_image_ui(ui);
+                        self.save_image_ui(ui, frame.wgpu_render_state().unwrap());
+
+                        config_updated |= self.add_config_ui(ui, 0);
+
+                        let mut i = 0;
+                        while let Some(response) = self.config_ui(ui, i) {
+                            i += 1;
+
+                            config_updated |= response.config_updated;
+                            vertical_updated |= response.vertical_updated;
+                            if response.removed {
+                                i -= 1;
+                            }
+
+                            config_updated |= self.add_config_ui(ui, i);
+                        }
+                    })
                 });
 
                 if let Some(initial_image) = self.initial_image.take() {
                     image_update = Some(image_update.unwrap_or(initial_image));
-                    threshold_updated = true;
+                    config_updated = true;
                 }
 
-                let config = threshold_updated.then(|| {
-                    config::ConfigBuffer::single_sorted(
-                        config::Sort::Increasing,
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss,
-                            reason = "self.threshold is in 0..=1 and must be converted to a u8"
-                        )]
-                        {
-                            (self.threshold * const { u8::MAX as f32 }) as u8
-                        },
-                        config::Sort::Increasing,
-                    )
-                    .finish()
+                let config = config_updated.then(|| {
+                    self.settings
+                        .iter()
+                        .map(|(settings, _)| settings.get_config())
+                        .collect()
                 });
+
+                let mut vertical = [false; Viewer::CAPACITY];
+                vertical
+                    .iter_mut()
+                    .zip(self.settings.iter().map(|(_, vertical)| vertical))
+                    .for_each(|(dst, src)| *dst = *src);
 
                 ui.add(Viewer {
                     size: ui.available_size(),
                     image_size: self.image_size,
                     image_updated: AtomicBool::new(image_update.is_some()),
                     image: image_update,
+                    num_configs: self.settings.len() as u32,
                     config,
-                    config_updated: AtomicBool::new(config.is_some()),
+                    config_updated: AtomicBool::new(config_updated),
+                    vertical,
+                    vertical_updated: AtomicBool::new(vertical_updated),
                 });
             })
         });
@@ -321,4 +257,104 @@ fn download_write_image(render_state: &egui_wgpu::RenderState, image_size: Vec2U
         .unwrap();
 
     rgb.save(path).unwrap();
+}
+
+impl App {
+    #[must_use]
+    fn open_image_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
+        ui.button("Open image file")
+            .clicked()
+            .then(|| {
+                rfd::FileDialog::new()
+                    .add_filter("image", &self.open_image_extensions)
+                    .set_directory(self.current_image.parent().unwrap())
+                    .pick_file()
+            })
+            .flatten()
+            .map(|path| {
+                let (img, image_size) = read_image(&path);
+                self.image_size = image_size;
+                self.current_image = path;
+                img
+            })
+    }
+
+    fn save_image_ui(&self, ui: &mut egui::Ui, render_state: &egui_wgpu::RenderState) {
+        if ui.button("Save image").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("image", &self.save_image_extensions)
+                .set_directory(self.current_image.parent().unwrap())
+                .set_file_name({
+                    let mut file_name = PathBuf::from(self.current_image.file_name().unwrap());
+                    file_name.set_extension("");
+                    let mut file_name = OsString::from(file_name);
+                    file_name.push(" pixel-sorted");
+                    let mut file_name = PathBuf::from(file_name);
+                    file_name
+                        .set_extension(self.current_image.extension().unwrap_or(OsStr::new("")));
+
+                    file_name.into_os_string().into_string().unwrap()
+                })
+                .save_file()
+        {
+            download_write_image(render_state, self.image_size, &path);
+        }
+    }
+
+    #[must_use]
+    fn add_config_ui(&mut self, ui: &mut egui::Ui, position: usize) -> bool {
+        let clicked = ui
+            .add_enabled(
+                self.settings.len() < Viewer::CAPACITY,
+                egui::Button::new("+"),
+            )
+            .clicked();
+        if clicked {
+            self.settings
+                .insert(position, (settings::Settings::new(), false));
+        }
+        clicked
+    }
+
+    #[must_use]
+    fn config_ui(&mut self, ui: &mut egui::Ui, i: usize) -> Option<ConfigUiResponse> {
+        let (settings, vertical) = self.settings.get_mut(i)?;
+
+        let mut response = ConfigUiResponse {
+            config_updated: false,
+            vertical_updated: false,
+            removed: false,
+        };
+
+        if egui::Frame::group(ui.style())
+            .show(ui, |ui| {
+                let delete_response = ui
+                    .horizontal(|ui| {
+                        response.vertical_updated = ui.checkbox(vertical, "Vertical").changed();
+                        ui.button("×")
+                    })
+                    .inner;
+                response.config_updated = ui.add(settings.widget()).changed();
+
+                delete_response
+            })
+            .inner
+            .clicked()
+        {
+            response.removed = true;
+            self.settings.remove(i);
+            response.config_updated = true;
+        }
+
+        Some(response)
+    }
+}
+
+struct ConfigUiResponse {
+    config_updated: bool,
+    vertical_updated: bool,
+    removed: bool,
 }

@@ -19,5 +19,8 @@ pixel-sort = { path = ".." }
 rfd = "0.17.2"
 wgpu.workspace = true
 
+[features]
+screenshot = []
+
 [lints]
 workspace = true
